@@ -1,6 +1,0 @@
-{
-    "files.associations": {
-        "string.h": "c",
-        "blake3.h": "c"
-    }
-}
