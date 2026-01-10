@@ -1,8 +1,4 @@
-/* 
- * File Duplicate Detector using BLAKE3 hashing
- * Main entry point
- */
-
+//main.c
 #include "utils.h"
 #include "hash_table.h"
 #include "empty_files.h"
@@ -12,13 +8,12 @@
 #include <string.h>
 #include <windows.h>
 
-// Ctrl+C handler
 BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT) {
         safe_printf("\n\nStopping monitoring...\n");
         g_stop_monitoring = 1;
-        signal_monitor_stop();  // Signal the monitor thread immediately
-        Sleep(200);  // Give threads time to stop gracefully
+        signal_monitor_stop();  
+        Sleep(200);  
         return TRUE;
     }
     return FALSE;
@@ -36,7 +31,6 @@ int main(int argc, char *argv[]) {
     
     strncpy(g_monitor_path, directory, MAX_PATH);
     
-    // Initialize all modules
     init_utils();
     
     safe_printf("=== File Duplicate Detector with Real-time Monitoring ===\n");
@@ -48,7 +42,6 @@ int main(int argc, char *argv[]) {
     g_hash_table = create_hash_table(10007);
     init_empty_files_list();
     
-    // Start monitor thread
     HANDLE hMonitorThread = CreateThread(NULL, 0, monitor_thread_func, 
                                          g_monitor_path, 0, NULL);
     if (!hMonitorThread) {
@@ -56,10 +49,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // Give monitor thread time to start
     Sleep(200);
     
-    // Start scanner thread
     HANDLE hScannerThread = CreateThread(NULL, 0, scanner_thread_func, 
                                          NULL, 0, NULL);
     if (!hScannerThread) {
@@ -69,7 +60,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // Wait for scanner to complete
     WaitForSingleObject(hScannerThread, INFINITE);
     CloseHandle(hScannerThread);
     
@@ -78,16 +68,14 @@ int main(int argc, char *argv[]) {
         WaitForSingleObject(hMonitorThread, INFINITE);
     } else {
         g_stop_monitoring = 1;
-        signal_monitor_stop();  // Signal monitor to stop immediately
+        signal_monitor_stop();  
         WaitForSingleObject(hMonitorThread, INFINITE);
     }
     
     CloseHandle(hMonitorThread);
     
-    // Small delay to ensure threads are fully cleaned up
     Sleep(100);
     
-    // Cleanup in reverse order of initialization
     free_hash_table(g_hash_table);
     g_hash_table = NULL;
     

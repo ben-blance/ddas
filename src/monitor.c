@@ -1,3 +1,4 @@
+//monitor.c
 #include "monitor.h"
 #include "scanner.h"
 #include "hash_table.h"
@@ -12,6 +13,102 @@
 static HANDLE g_stop_event = NULL;
 static CRITICAL_SECTION g_stop_event_lock;
 static BOOL g_monitor_initialized = FALSE;
+
+// Helper function to count files in a directory (non-recursive)
+static int count_files_in_directory(const char *dir_path) {
+    WIN32_FIND_DATA find_data;
+    HANDLE hFind;
+    char search_path[MAX_PATH];
+    int count = 0;
+    
+    snprintf(search_path, MAX_PATH, "%s\\*", dir_path);
+    
+    hFind = FindFirstFile(search_path, &find_data);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    
+    do {
+        if (strcmp(find_data.cFileName, ".") == 0 || 
+            strcmp(find_data.cFileName, "..") == 0) {
+            continue;
+        }
+        count++;
+    } while (FindNextFile(hFind, &find_data));
+    
+    FindClose(hFind);
+    return count;
+}
+
+// Wait for directory copy operation to complete by monitoring file count stability
+static BOOL wait_for_directory_stable(const char *dir_path, int max_wait_seconds) {
+    int prev_count = -1;
+    int stable_count = 0;
+    int checks = 0;
+    int max_checks = max_wait_seconds * 10; // Check every 100ms
+    
+    while (checks < max_checks) {
+        int current_count = count_files_in_directory(dir_path);
+        
+        if (current_count == prev_count && current_count > 0) {
+            stable_count++;
+            // If count is stable for 3 consecutive checks (300ms), consider it done
+            if (stable_count >= 3) {
+                return TRUE;
+            }
+        } else {
+            stable_count = 0;
+        }
+        
+        prev_count = current_count;
+        Sleep(100);
+        checks++;
+        
+        // Stop if monitoring is cancelled
+        if (g_stop_monitoring) {
+            return FALSE;
+        }
+    }
+    
+    // Timeout - proceed anyway
+    return TRUE;
+}
+
+// Helper function to recursively scan a newly created/copied directory
+static void scan_new_directory(const char *dir_path) {
+    WIN32_FIND_DATA find_data;
+    HANDLE hFind;
+    char search_path[MAX_PATH];
+    
+    snprintf(search_path, MAX_PATH, "%s\\*", dir_path);
+    
+    hFind = FindFirstFile(search_path, &find_data);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    
+    do {
+        if (strcmp(find_data.cFileName, ".") == 0 || 
+            strcmp(find_data.cFileName, "..") == 0) {
+            continue;
+        }
+        
+        char full_path[MAX_PATH];
+        snprintf(full_path, MAX_PATH, "%s\\%s", dir_path, find_data.cFileName);
+        
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // Recursively scan subdirectories
+            scan_new_directory(full_path);
+        } else {
+            // Process file
+            if (!should_ignore_file(find_data.cFileName)) {
+                process_file(full_path, "ADDED");
+            }
+        }
+    } while (FindNextFile(hFind, &find_data));
+    
+    FindClose(hFind);
+}
 
 DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
     const char *dir_path = (const char*)lpParam;
@@ -68,8 +165,8 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
                 buffer,
                 sizeof(buffer),
                 TRUE,
-                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | 
-                FILE_NOTIFY_CHANGE_LAST_WRITE,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | 
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
                 &bytes_returned,
                 &overlapped,
                 NULL
@@ -138,10 +235,24 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
                 switch (fni->Action) {
                     case FILE_ACTION_ADDED: {
                         DWORD attrs = GetFileAttributes(full_path);
-                        if (attrs != INVALID_FILE_ATTRIBUTES && 
-                            !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-                            Sleep(100);
-                            process_file(full_path, "ADDED");
+                        if (attrs != INVALID_FILE_ATTRIBUTES) {
+                            if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                                // New directory created - wait for copy to complete
+                                safe_printf("[DIRECTORY ADDED] %s - Waiting for copy to complete...\n", full_path);
+                                
+                                // Wait up to 60 seconds for the directory to stabilize
+                                if (wait_for_directory_stable(full_path, 60)) {
+                                    safe_printf("[DIRECTORY STABLE] %s - Scanning contents...\n", full_path);
+                                    scan_new_directory(full_path);
+                                } else {
+                                    safe_printf("[DIRECTORY TIMEOUT] %s - Scanning anyway...\n", full_path);
+                                    scan_new_directory(full_path);
+                                }
+                            } else {
+                                // Regular file added
+                                Sleep(100);
+                                process_file(full_path, "ADDED");
+                            }
                         }
                         break;
                     }
@@ -159,22 +270,43 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
                         break;
                     }
                     
-                    case FILE_ACTION_REMOVED:
-                        safe_printf("[DELETED] %s\n", full_path);
-                        remove_file_from_table(g_hash_table, full_path);
-                        remove_empty_file(full_path);
+                    case FILE_ACTION_REMOVED: {
+                        DWORD attrs = GetFileAttributes(full_path);
+                        // If it's a directory that was removed, we don't need to do anything
+                        // as individual file removals will be reported
+                        if (attrs == INVALID_FILE_ATTRIBUTES) {
+                            safe_printf("[DELETED] %s\n", full_path);
+                            remove_file_from_table(g_hash_table, full_path);
+                            remove_empty_file(full_path);
+                        }
                         break;
+                    }
                         
                     case FILE_ACTION_RENAMED_OLD_NAME:
                         safe_printf("[RENAMED FROM] %s\n", full_path);
                         remove_file_from_table(g_hash_table, full_path);
+                        remove_empty_file(full_path);
                         break;
                         
                     case FILE_ACTION_RENAMED_NEW_NAME: {
                         DWORD attrs = GetFileAttributes(full_path);
-                        if (attrs != INVALID_FILE_ATTRIBUTES && 
-                            !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-                            process_file(full_path, "RENAMED TO");
+                        if (attrs != INVALID_FILE_ATTRIBUTES) {
+                            if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                                // Directory renamed - wait and scan
+                                safe_printf("[DIRECTORY RENAMED TO] %s - Waiting for stability...\n", full_path);
+                                
+                                if (wait_for_directory_stable(full_path, 60)) {
+                                    safe_printf("[DIRECTORY STABLE] %s - Scanning contents...\n", full_path);
+                                    scan_new_directory(full_path);
+                                } else {
+                                    safe_printf("[DIRECTORY TIMEOUT] %s - Scanning anyway...\n", full_path);
+                                    scan_new_directory(full_path);
+                                }
+                            } else {
+                                // File renamed
+                                Sleep(100);
+                                process_file(full_path, "RENAMED TO");
+                            }
                         }
                         break;
                     }

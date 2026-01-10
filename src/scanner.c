@@ -1,3 +1,4 @@
+//scanner.c
 #include "scanner.h"
 #include "file_ops.h"
 #include "empty_files.h"
