@@ -4,16 +4,18 @@
 #include "empty_files.h"
 #include "scanner.h"
 #include "monitor.h"
+#include "ipc_pipe.h"
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
 
 BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT) {
-        safe_printf("\n\nStopping monitoring...\n");
+        safe_printf("\n\nStopping monitoring and IPC server...\n");
         g_stop_monitoring = 1;
-        signal_monitor_stop();  
-        Sleep(200);  
+        signal_monitor_stop();
+        shutdown_pipe_server();
+        Sleep(200);
         return TRUE;
     }
     return FALSE;
@@ -39,6 +41,11 @@ int main(int argc, char *argv[]) {
     
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     
+    // Initialize IPC pipe server
+    if (!init_pipe_server()) {
+        safe_printf("[WARNING] Failed to initialize IPC server. GUI alerts will not work.\n");
+    }
+    
     g_hash_table = create_hash_table(10007);
     init_empty_files_list();
     
@@ -46,6 +53,7 @@ int main(int argc, char *argv[]) {
                                          g_monitor_path, 0, NULL);
     if (!hMonitorThread) {
         safe_printf("Failed to create monitor thread\n");
+        shutdown_pipe_server();
         return 1;
     }
     
@@ -57,6 +65,7 @@ int main(int argc, char *argv[]) {
         safe_printf("Failed to create scanner thread\n");
         g_stop_monitoring = 1;
         WaitForSingleObject(hMonitorThread, INFINITE);
+        shutdown_pipe_server();
         return 1;
     }
     
@@ -68,13 +77,16 @@ int main(int argc, char *argv[]) {
         WaitForSingleObject(hMonitorThread, INFINITE);
     } else {
         g_stop_monitoring = 1;
-        signal_monitor_stop();  
+        signal_monitor_stop();
         WaitForSingleObject(hMonitorThread, INFINITE);
     }
     
     CloseHandle(hMonitorThread);
     
     Sleep(100);
+    
+    // Cleanup IPC server
+    shutdown_pipe_server();
     
     free_hash_table(g_hash_table);
     g_hash_table = NULL;
