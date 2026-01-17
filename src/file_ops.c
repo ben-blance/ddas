@@ -14,7 +14,7 @@ int is_file_empty(const char *filepath) {
     HANDLE hFile = CreateFile(
         filepath,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
@@ -63,8 +63,18 @@ int should_ignore_file(const char *filename) {
 }
 
 int hash_file(const char *filepath, char *hex_output) {
-    FILE *file = fopen(filepath, "rb");
-    if (!file) {
+    // Use CreateFile instead of fopen for better sharing control
+    HANDLE hFile = CreateFile(
+        filepath,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,  // Allow sharing
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    
+    if (hFile == INVALID_HANDLE_VALUE) {
         return -1;
     }
     
@@ -72,9 +82,13 @@ int hash_file(const char *filepath, char *hex_output) {
     blake3_hasher_init(&hasher);
     
     unsigned char *buffer = malloc(BUFFER_SIZE);
-    size_t bytes_read;
+    if (!buffer) {
+        CloseHandle(hFile);
+        return -1;
+    }
     
-    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+    DWORD bytes_read;
+    while (ReadFile(hFile, buffer, BUFFER_SIZE, &bytes_read, NULL) && bytes_read > 0) {
         blake3_hasher_update(&hasher, buffer, bytes_read);
     }
     
@@ -87,7 +101,8 @@ int hash_file(const char *filepath, char *hex_output) {
     hex_output[HASH_SIZE * 2] = '\0';
     
     free(buffer);
-    fclose(file);
+    CloseHandle(hFile);  // Ensure file is closed
+    
     return 0;
 }
 

@@ -12,6 +12,7 @@
 #pragma comment(lib, "user32.lib")
 
 #define WM_TRAYICON (WM_USER + 1)
+#define WM_PIPE_MESSAGE (WM_USER + 2)
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_SHOW_WINDOW 1002
 #define ID_TRAY_ABOUT 1003
@@ -152,7 +153,7 @@ void ParseAlertJSON(const char *json) {
     LeaveCriticalSection(&g_alert_lock);
 }
 
-// Pipe reader thread
+// Pipe reader thread - uses overlapped I/O for non-blocking reads
 DWORD WINAPI PipeReaderThread(LPVOID param) {
     (void)param;
     char buffer[65536];
@@ -165,7 +166,7 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
             0,
             NULL,
             OPEN_EXISTING,
-            0,
+            FILE_FLAG_OVERLAPPED,  // Use overlapped I/O
             NULL
         );
         
@@ -174,44 +175,66 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
                 WaitNamedPipe(PIPE_NAME, 1000);
                 continue;
             }
-            Sleep(2000); // Wait and retry
+            Sleep(2000);
             continue;
         }
         
-        // Connected
+        // Set message mode
         DWORD mode = PIPE_READMODE_MESSAGE;
         SetNamedPipeHandleState(g_hPipe, &mode, NULL, NULL);
         
-        // Read messages
+        // Create event for overlapped I/O
+        OVERLAPPED overlapped = {0};
+        overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        
+        // Read messages with timeout
         while (g_running) {
             DWORD bytes_read;
-            BOOL success = ReadFile(g_hPipe, buffer, sizeof(buffer) - 1, &bytes_read, NULL);
+            ResetEvent(overlapped.hEvent);
             
-            if (!success || bytes_read == 0) {
+            // Start async read
+            BOOL success = ReadFile(g_hPipe, buffer, sizeof(buffer) - 1, &bytes_read, &overlapped);
+            DWORD error = GetLastError();
+            
+            if (!success && error != ERROR_IO_PENDING) {
+                break; // Pipe broken
+            }
+            
+            // Wait for read to complete or timeout (100ms)
+            DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 100);
+            
+            if (wait_result == WAIT_TIMEOUT) {
+                // Process Windows messages while waiting
+                continue;
+            }
+            
+            if (wait_result != WAIT_OBJECT_0) {
+                break; // Error
+            }
+            
+            // Get result
+            if (!GetOverlappedResult(g_hPipe, &overlapped, &bytes_read, FALSE)) {
+                break; // Error
+            }
+            
+            if (bytes_read == 0) {
                 break; // Disconnected
             }
             
             buffer[bytes_read] = '\0';
             
-            // Check message type
+            // Check message type and post to main window
             if (strstr(buffer, "\"type\":\"ALERT\"") && strstr(buffer, "\"DUPLICATE_DETECTED\"")) {
                 ParseAlertJSON(buffer);
                 
-                // Show notification
-                EnterCriticalSection(&g_alert_lock);
-                char notification[512];
-                snprintf(notification, sizeof(notification), 
-                        "Duplicate found: %s\n%d matching file(s)",
-                        g_current_alert.trigger_file.filename,
-                        g_current_alert.duplicate_count);
-                LeaveCriticalSection(&g_alert_lock);
-                
-                ShowTrayNotification("DDAS - Duplicate Detected", notification);
+                // Post message to main window instead of blocking
+                PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 0, 0);
             } else if (strstr(buffer, "\"SCAN_COMPLETE\"")) {
-                ShowTrayNotification("DDAS", "Initial scan complete");
+                PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 1, 0);
             }
         }
         
+        CloseHandle(overlapped.hEvent);
         CloseHandle(g_hPipe);
         g_hPipe = INVALID_HANDLE_VALUE;
     }
@@ -356,16 +379,29 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                                 filepath);
                         
                         if (MessageBox(hwnd, msg, "Confirm Delete", MB_YESNO | MB_ICONWARNING) == IDYES) {
-                            SHFILEOPSTRUCT fileOp = {0};
-                            fileOp.wFunc = FO_DELETE;
-                            fileOp.pFrom = filepath;
-                            fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
+                            // Double-null terminated string for SHFileOperation
+                            char from_path[MAX_PATH + 2];
+                            memset(from_path, 0, sizeof(from_path));
+                            strncpy(from_path, filepath, MAX_PATH);
                             
-                            if (SHFileOperation(&fileOp) == 0) {
+                            SHFILEOPSTRUCT fileOp = {0};
+                            fileOp.hwnd = hwnd;
+                            fileOp.wFunc = FO_DELETE;
+                            fileOp.pFrom = from_path;
+                            fileOp.pTo = NULL;
+                            fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+                            
+                            int result = SHFileOperation(&fileOp);
+                            
+                            if (result == 0 && !fileOp.fAnyOperationsAborted) {
                                 MessageBox(hwnd, "File moved to Recycle Bin.", "Success", MB_OK | MB_ICONINFORMATION);
                                 ListView_DeleteItem(hListView, selected);
                             } else {
-                                MessageBox(hwnd, "Failed to delete file.", "Error", MB_OK | MB_ICONERROR);
+                                char error_msg[256];
+                                snprintf(error_msg, sizeof(error_msg), 
+                                        "Failed to delete file.\nError code: %d\n\nThe file may be locked or in use.", 
+                                        result);
+                                MessageBox(hwnd, error_msg, "Error", MB_OK | MB_ICONERROR);
                             }
                         }
                     } else {
@@ -420,6 +456,7 @@ void ShowReportWindow(void) {
     
     ShowWindow(g_hReportWnd, SW_SHOW);
     UpdateWindow(g_hReportWnd);
+    SetForegroundWindow(g_hReportWnd);
 }
 
 // Main Window Procedure
@@ -437,8 +474,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             Shell_NotifyIcon(NIM_ADD, &g_nid);
             break;
         
+        case WM_PIPE_MESSAGE:
+            // Message from pipe thread
+            if (wParam == 0) {
+                // Duplicate detected
+                EnterCriticalSection(&g_alert_lock);
+                char notification[512];
+                snprintf(notification, sizeof(notification), 
+                        "Duplicate found: %s\n%d matching file(s)",
+                        g_current_alert.trigger_file.filename,
+                        g_current_alert.duplicate_count);
+                LeaveCriticalSection(&g_alert_lock);
+                
+                ShowTrayNotification("DDAS - Duplicate Detected", notification);
+            } else if (wParam == 1) {
+                // Scan complete
+                ShowTrayNotification("DDAS", "Initial scan complete");
+            }
+            break;
+        
         case WM_TRAYICON:
-            if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
+            if (lParam == WM_LBUTTONDBLCLK) {
+                // Double-click on tray icon - show report
+                if (g_current_alert.duplicate_count > 0) {
+                    ShowReportWindow();
+                }
+            } else if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
                 POINT pt;
                 GetCursorPos(&pt);
                 
@@ -505,7 +566,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = "DDASTrayClas";
+    wc.lpszClassName = "DDASTrayClass";
     
     if (!RegisterClassEx(&wc)) {
         MessageBox(NULL, "Window Registration Failed!", "Error", MB_ICONEXCLAMATION | MB_OK);
@@ -514,7 +575,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     // Create hidden window for tray icon
     g_hMainWnd = CreateWindowEx(
-        0, "DDASTrayClas", "DDAS Tray",
+        0, "DDASTrayClass", "DDAS Tray",
         0, 0, 0, 0, 0,
         NULL, NULL, hInstance, NULL
     );

@@ -37,7 +37,7 @@ void get_file_modified_time(const char *filepath, char *buffer, size_t buffer_si
 // Generate unique file index
 uint64_t generate_file_index(const char *filepath) {
     BY_HANDLE_FILE_INFORMATION file_info;
-    HANDLE hFile = CreateFile(filepath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    HANDLE hFile = CreateFile(filepath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     
     if (hFile == INVALID_HANDLE_VALUE) {
@@ -256,7 +256,9 @@ static BOOL send_message(const char *json_message) {
         NULL
     );
     
-    FlushFileBuffers(g_pipe_server->pipe_handle);
+    if (success) {
+        FlushFileBuffers(g_pipe_server->pipe_handle);
+    }
     
     LeaveCriticalSection(&g_pipe_server->lock);
     
