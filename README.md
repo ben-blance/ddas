@@ -50,97 +50,314 @@ DDAS/
 ├── build/               # Build output
 └── Makefile
 ```
+# DDAS Quick Start Guide
 
-## Setup Instructions
+## 🚀 Getting Started (3 Steps)
 
-### Step 1: Create GUI Directory
+### Step 1: Build Everything
+```cmd
+mingw32-make
+```
+
+You should see:
+```
+Compiling src/main.c...
+Compiling src/ipc_pipe.c...
+...
+Detection Engine built successfully!
+GUI Application built successfully!
+
+========================================
+DDAS Build Complete!
+========================================
+Engine: ddas_engine.exe
+GUI:    ddas_gui.exe
+```
+
+### Step 2: Run the System
+```cmd
+mingw32-make run-both
+```
+
+This will:
+1. ✅ Start the detection engine (minimized console window)
+2. ✅ Wait 2 seconds for engine to initialize
+3. ✅ Start the GUI (system tray icon appears)
+
+### Step 3: Test It!
+
+**Create a duplicate file:**
+```cmd
+cd C:\Users\Sahil\Documents\testfolder
+echo Hello World > file1.txt
+copy file1.txt file2.txt
+```
+
+**What happens:**
+1. 🔍 Engine detects the duplicate
+2. 💬 Toast notification appears: "Duplicate found: file2.txt"
+3. 🖱️ Click the notification
+4. 📊 Report window opens showing both files
+
+---
+
+## 🎯 Common Commands
+
+| Command | What it does |
+|---------|--------------|
+| `mingw32-make` | Build everything |
+| `mingw32-make run-both` | Start engine + GUI |
+| `mingw32-make stop` | Stop everything |
+| `mingw32-make clean` | Clean build files |
+| `mingw32-make help` | Show all commands |
+
+---
+
+## 🛠️ Individual Components
+
+### Run Engine Only (for testing)
+```cmd
+mingw32-make run-engine
+```
+- Console stays open
+- Shows all file operations
+- Press Ctrl+C to stop
+
+### Run GUI Only (engine must be running first!)
+```cmd
+# In terminal 1:
+mingw32-make run-engine
+
+# In terminal 2:
+mingw32-make run-gui
+```
+
+---
+
+## 🔧 Troubleshooting
+
+### Problem: "GUI not connecting"
+**Symptoms:**
+- No notifications appearing
+- Tray icon present but inactive
+
+**Solution:**
+1. Make sure engine is running first
+2. Check engine console for: `[IPC] GUI client connected`
+3. Restart in correct order: engine → GUI
 
 ```cmd
-mkdir gui
+mingw32-make stop
+mingw32-make run-both
 ```
 
-### Step 2: Add New Files
+### Problem: "Pipe already in use"
+**Symptoms:**
+- Engine fails to start
+- Error about pipe creation
 
-1. **Create `include/ipc_pipe.h`** - Copy the IPC header content
-2. **Create `src/ipc_pipe.c`** - Copy the IPC implementation
-3. **Create `gui/gui_tray.c`** - Copy the GUI application
-4. **Update `src/hash_table.c`** - Add IPC integration
-5. **Update `src/main.c`** - Initialize IPC server
-6. **Update `Makefile`** - Add new build targets
-
-### Step 3: Build
-
+**Solution:**
+Kill any existing processes:
 ```cmd
-make all
+mingw32-make stop
 ```
 
-This builds:
-- `build/ddas_engine.exe` - Detection engine
-- `build/ddas_gui.exe` - GUI tray application
-
-### Step 4: Install (Optional)
-
+Or manually:
 ```cmd
-make install
+taskkill /F /IM ddas_engine.exe
+taskkill /F /IM ddas_gui.exe
 ```
 
-Copies executables to project root for easier access.
+### Problem: No tray icon visible
+**Solution:**
+- Check Windows notification area (bottom-right)
+- Click the up arrow (^) to show hidden icons
+- Right-click taskbar → Taskbar settings → Turn on all system icons
 
-## Usage
+### Problem: Build errors
+**Check:**
+1. All files are in place:
+   ```
+   src/ipc_pipe.c
+   include/ipc_pipe.h
+   gui/gui_tray.c
+   ```
 
-### Running the System
+2. Updated `hash_table.c` with IPC integration
 
-**Option 1: Manual Start (Development)**
+3. Clean and rebuild:
+   ```cmd
+   mingw32-make clean
+   mingw32-make
+   ```
 
-1. Start the detection engine first:
+---
+
+## 📁 Changing Monitored Directory
+
+Edit the Makefile, find these lines:
+
+```makefile
+# Line ~97 (in run-engine target)
+@.\$(ENGINE_TARGET) C:\Users\Sahil\Documents\testfolder --watch
+
+# Line ~117 (in create-start-script target)
+@echo start "DDAS Engine" /MIN $(ENGINE_TARGET) "C:\Users\Sahil\Documents\testfolder" --watch >> start_ddas.bat
+```
+
+Change `C:\Users\Sahil\Documents\testfolder` to your desired path.
+
+---
+
+## 🎨 Using the GUI
+
+### Tray Icon Menu
+**Right-click the tray icon:**
+- **Show Last Alert** → Opens report window for last duplicate
+- **About** → Shows version info
+- **Exit** → Closes GUI (engine keeps running)
+
+### Report Window
+**Displays:**
+- Trigger file (the new file that caused the alert)
+- All duplicate files in the group
+- File details: size, modified date
+
+**Actions:**
+- **Open File Location** → Opens Explorer at file location
+- **Delete Selected** → Moves file to Recycle Bin (safe delete)
+- **Close** → Closes window
+
+---
+
+## 📊 Console Output Examples
+
+### Engine Starting:
+```
+=== File Duplicate Detector with Real-time Monitoring ===
+Directory: C:\Users\Sahil\Documents\testfolder
+Mode: Scan + Watch
+
+[IPC] Named Pipe server initialized on \\.\pipe\ddas_ipc
+[IPC] Waiting for GUI client to connect...
+
+=== File System Monitor Started ===
+Watching for changes during scan and after...
+
+[SCAN] C:\Users\Sahil\Documents\testfolder\file1.txt
+[SCAN] C:\Users\Sahil\Documents\testfolder\file2.txt
+
+[DUPLICATE DETECTED]
+New file: C:\Users\Sahil\Documents\testfolder\file2.txt
+Matches existing files:
+ - C:\Users\Sahil\Documents\testfolder\file1.txt
+```
+
+### GUI Connecting:
+```
+[IPC] GUI client connected
+```
+
+### Duplicate Alert Sent:
+```
+[DUPLICATE DETECTED]
+New file: C:\...\file2.txt
+Matches existing files:
+ - C:\...\file1.txt
+```
+
+---
+
+## 🎯 Test Scenarios
+
+### Scenario 1: Copy Files
 ```cmd
-ddas_engine.exe "C:\Users\Sahil\Desktop\test" --watch
+cd C:\Users\Sahil\Documents\testfolder
+echo Test > original.txt
+copy original.txt copy1.txt
+copy original.txt copy2.txt
 ```
+**Expected:** 2 alerts (for copy1.txt and copy2.txt)
 
-2. Start the GUI in a separate terminal:
+### Scenario 2: Create Directory with Duplicates
 ```cmd
-ddas_gui.exe
+mkdir subdir
+copy original.txt subdir\duplicate.txt
 ```
+**Expected:** 1 alert for subdir\duplicate.txt
 
-**Option 2: Quick Start Script**
-
-Create `start_ddas.bat`:
-```batch
-@echo off
-echo Starting DDAS...
-start /B ddas_engine.exe "C:\Users\Sahil\Desktop\test" --watch
-timeout /t 2 /nobreak >nul
-start ddas_gui.exe
-echo DDAS Started!
-```
-
-### Command Line Options
-
-**Engine:**
+### Scenario 3: Modify File
 ```cmd
-ddas_engine.exe <directory>          # Scan once, then exit
-ddas_engine.exe <directory> --watch  # Scan and continue monitoring
+echo Modified >> original.txt
 ```
+**Expected:** File reprocessed, old duplicates removed, new hash added
 
-**GUI:**
+---
+
+## 🔄 Daily Workflow
+
+### Morning: Start System
 ```cmd
-ddas_gui.exe  # No arguments needed
+mingw32-make run-both
 ```
 
-### What Happens
+### Work: Monitor happens automatically
+- Save files as normal
+- Get alerts when duplicates appear
+- Review duplicates periodically
 
-1. **Engine starts** and creates Named Pipe server on `\\.\pipe\ddas_ipc`
-2. **Engine scans** the specified directory
-3. **GUI connects** to the Named Pipe
-4. **When duplicate found**:
-   - Engine sends JSON alert via pipe
-   - GUI shows toast notification
-   - User clicks notification
-   - Report window opens with details
-5. **User actions**:
-   - View all duplicate files in a group
-   - Open file location in Explorer
-   - Delete files (moves to Recycle Bin)
+### Evening: Stop System
+```cmd
+mingw32-make stop
+```
+
+Or: Right-click tray icon → Exit (stops GUI, engine keeps running)
+
+---
+
+## 📈 Next Steps
+
+1. **Test the basic functionality** with the commands above
+2. **Watch the console** to understand the detection flow
+3. **Try the GUI features** (notifications, report window, delete)
+4. **Experiment with different file scenarios**
+
+Once you're comfortable, you can extend the system with:
+- Database integration (SQLite)
+- DELETE_FILES command implementation
+- Quarantine directory
+- Service mode for auto-start
+
+---
+
+## 💡 Pro Tips
+
+1. **Keep console window visible** during development to see IPC messages
+2. **Test GUI reconnection** by closing and reopening it
+3. **Use different test directories** to avoid confusion
+4. **Check Windows Event Viewer** if pipe issues occur
+5. **Monitor with Process Explorer** to see pipe connections
+
+---
+
+## 📞 Quick Reference Card
+
+```
+BUILD:    mingw32-make
+RUN:      mingw32-make run-both
+STOP:     mingw32-make stop
+CLEAN:    mingw32-make clean
+HELP:     mingw32-make help
+```
+
+**File Locations:**
+- Engine: `ddas_engine.exe`
+- GUI: `ddas_gui.exe`
+- Pipe: `\\.\pipe\ddas_ipc`
+- Test Dir: `C:\Users\Sahil\Documents\testfolder`
+
+---
+
 
 ## JSON Message Format
 
@@ -304,3 +521,5 @@ MIT License - Feel free to modify and distribute.
 ## Author
 
 Developed for real-time duplicate file detection and user notification.
+
+Happy duplicate detecting! 🎉
