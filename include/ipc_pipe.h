@@ -7,6 +7,8 @@
 #define PIPE_NAME "\\\\.\\pipe\\ddas_ipc"
 #define PIPE_BUFFER_SIZE 65536
 #define MAX_MESSAGE_SIZE 32768
+#define MAX_DUPLICATES 100
+#define MAX_HISTORY_ALERTS 100
 
 // Message types
 typedef enum {
@@ -49,6 +51,14 @@ typedef struct {
     uint64_t file_index;     // Unique file identifier
 } FileInfo;
 
+// Duplicate alert structure (for history storage)
+typedef struct {
+    FileInfo trigger_file;
+    FileInfo duplicates[MAX_DUPLICATES];
+    int duplicate_count;
+    char timestamp[32];
+} DuplicateAlert;
+
 // IPC message structures
 typedef struct {
     MessageType type;
@@ -88,6 +98,9 @@ BOOL send_alert_scan_complete(int total_files, int duplicate_groups, const char 
 
 // Send error alert
 BOOL send_alert_error(const char *error_message, const char *timestamp);
+
+// Send all stored alerts to newly connected client
+BOOL send_alert_history_to_client(void);
 
 // Helper: Get current ISO 8601 timestamp
 void get_iso8601_timestamp(char *buffer, size_t buffer_size);

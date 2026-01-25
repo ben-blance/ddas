@@ -224,13 +224,17 @@ void find_duplicates(HashTable *table) {
                 continue;
             }
             
+            // Count files with this hash
             int count = 0;
-            FileHash *counter = table->buckets[i];
-            while (counter) {
-                if (strcmp(counter->hash, current->hash) == 0) {
-                    count++;
+            FileHash *counter = current;
+            for (size_t k = i; k < table->size; k++) {
+                FileHash *temp = (k == i) ? counter : table->buckets[k];
+                while (temp) {
+                    if (strcmp(temp->hash, current->hash) == 0) {
+                        count++;
+                    }
+                    temp = temp->next;
                 }
-                counter = counter->next;
             }
             
             if (count > 1) {
@@ -239,14 +243,61 @@ void find_duplicates(HashTable *table) {
                 safe_printf("Duplicate group #%d (hash: %s):\n", 
                        duplicate_groups, current->hash);
                 
-                FileHash *printer = table->buckets[i];
-                while (printer) {
-                    if (strcmp(printer->hash, current->hash) == 0) {
-                        safe_printf(" - %s\n", printer->filepath);
+                // Collect all files with this hash for IPC alert
+                FileInfo *all_files = malloc(sizeof(FileInfo) * count);
+                int file_index = 0;
+                
+                for (size_t k = i; k < table->size && file_index < count; k++) {
+                    FileHash *temp = (k == i) ? current : table->buckets[k];
+                    while (temp && file_index < count) {
+                        if (strcmp(temp->hash, current->hash) == 0) {
+                            safe_printf(" - %s\n", temp->filepath);
+                            
+                            // Populate FileInfo
+                            FileInfo *info = &all_files[file_index];
+                            strncpy(info->filepath, temp->filepath, MAX_PATH - 1);
+                            info->filepath[MAX_PATH - 1] = '\0';
+                            
+                            const char *filename = strrchr(temp->filepath, '\\');
+                            filename = filename ? filename + 1 : temp->filepath;
+                            strncpy(info->filename, filename, MAX_PATH - 1);
+                            info->filename[MAX_PATH - 1] = '\0';
+                            
+                            strncpy(info->filehash, current->hash, 64);
+                            info->filehash[64] = '\0';
+                            
+                            // Get file size
+                            WIN32_FILE_ATTRIBUTE_DATA file_data;
+                            if (GetFileAttributesEx(temp->filepath, GetFileExInfoStandard, &file_data)) {
+                                info->filesize = ((uint64_t)file_data.nFileSizeHigh << 32) | file_data.nFileSizeLow;
+                            } else {
+                                info->filesize = 0;
+                            }
+                            
+                            get_file_modified_time(temp->filepath, info->last_modified, sizeof(info->last_modified));
+                            info->file_index = generate_file_index(temp->filepath);
+                            
+                            file_index++;
+                        }
+                        temp = temp->next;
                     }
-                    printer = printer->next;
                 }
+                
                 safe_printf("\n");
+                
+                // Send IPC alert: use first file as trigger, rest as duplicates
+                if (file_index > 1) {
+                    char timestamp[32];
+                    get_iso8601_timestamp(timestamp, sizeof(timestamp));
+                    
+                    // Release lock before sending
+                    LeaveCriticalSection(&table->lock);
+                    send_alert_duplicate_detected(&all_files[0], &all_files[1], file_index - 1, timestamp);
+                    Sleep(100); // Small delay between alerts so GUI can process them
+                    EnterCriticalSection(&table->lock);
+                }
+                
+                free(all_files);
                 
                 processed_hashes[processed_count] = _strdup(current->hash);
                 processed_count++;

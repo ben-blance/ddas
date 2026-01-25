@@ -1,4 +1,4 @@
-// gui_tray.c - DDAS Tray Application
+// gui_tray.c - DDAS Tray Application with Group-Based Duplicate Tracking
 #define _WIN32_WINNT 0x0600
 #include <windows.h>
 #include <shellapi.h>
@@ -19,6 +19,7 @@
 
 #define PIPE_NAME "\\\\.\\pipe\\ddas_ipc"
 #define MAX_DUPLICATES 100
+#define MAX_ALERTS 100
 
 typedef struct {
     char filepath[MAX_PATH];
@@ -31,10 +32,12 @@ typedef struct {
 } FileInfo;
 
 typedef struct {
+    char filehash[65];  // Group identifier
     FileInfo trigger_file;
     FileInfo duplicates[MAX_DUPLICATES];
     int duplicate_count;
     char timestamp[32];
+    int files_remaining;  // Count of files that still exist
 } DuplicateAlert;
 
 // Global variables
@@ -44,7 +47,11 @@ NOTIFYICONDATA g_nid = {0};
 HANDLE g_hPipeThread = NULL;
 HANDLE g_hPipe = INVALID_HANDLE_VALUE;
 volatile BOOL g_running = TRUE;
-DuplicateAlert g_current_alert = {0};
+
+// Alerts storage (group-based)
+DuplicateAlert g_alerts[MAX_ALERTS];
+int g_alert_count = 0;
+int g_current_alert_index = 0;
 CRITICAL_SECTION g_alert_lock;
 
 // Forward declarations
@@ -55,6 +62,9 @@ void ShowTrayNotification(const char *title, const char *message);
 void ShowReportWindow(void);
 void ParseAlertJSON(const char *json);
 BOOL FileExists(const char *filepath);
+void UpdateReportWindow(void);
+int CountRemainingFiles(DuplicateAlert *alert);
+int FindNextValidGroup(int current_index, int direction);
 
 // Check if file exists
 BOOL FileExists(const char *filepath) {
@@ -75,11 +85,117 @@ void format_file_size(unsigned long long size, char *buffer, size_t buf_size) {
     }
 }
 
-// Simple JSON parser for our specific format
+// Count how many files still exist in this group
+int CountRemainingFiles(DuplicateAlert *alert) {
+    int count = 0;
+    
+    if (FileExists(alert->trigger_file.filepath)) {
+        count++;
+    }
+    
+    for (int i = 0; i < alert->duplicate_count; i++) {
+        if (FileExists(alert->duplicates[i].filepath)) {
+            count++;
+        }
+    }
+    
+    return count;
+}
+
+// Find next valid group (with at least 2 files remaining)
+// direction: 1 = next, -1 = previous
+int FindNextValidGroup(int current_index, int direction) {
+    int index = current_index;
+    int steps = 0;
+    int max_steps = g_alert_count;  // Prevent infinite loop
+    
+    while (steps < max_steps) {
+        index += direction;
+        steps++;
+        
+        // Wrap around or stop at boundaries
+        if (index < 0) {
+            return current_index;  // Stay at current if no previous valid group
+        }
+        if (index >= g_alert_count) {
+            return current_index;  // Stay at current if no next valid group
+        }
+        
+        // Check if this group has at least 2 files remaining
+        int remaining = CountRemainingFiles(&g_alerts[index]);
+        if (remaining >= 2) {
+            return index;
+        }
+    }
+    
+    return current_index;
+}
+
+// Find existing alert by hash or return -1
+int find_alert_by_hash(const char *filehash) {
+    for (int i = 0; i < g_alert_count; i++) {
+        if (strcmp(g_alerts[i].filehash, filehash) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Parse alert JSON and update groups
 void ParseAlertJSON(const char *json) {
     EnterCriticalSection(&g_alert_lock);
     
-    memset(&g_current_alert, 0, sizeof(DuplicateAlert));
+    char filehash[65] = {0};
+    
+    // Parse filehash first to identify the group
+    const char *hash_start = strstr(json, "\"filehash\":\"");
+    if (hash_start) {
+        hash_start += 12;
+        const char *hash_end = strchr(hash_start, '"');
+        if (hash_end) {
+            size_t len = hash_end - hash_start;
+            if (len < 65) {
+                strncpy(filehash, hash_start, len);
+                filehash[len] = '\0';
+            }
+        }
+    }
+    
+    if (strlen(filehash) == 0) {
+        LeaveCriticalSection(&g_alert_lock);
+        return;  // Invalid JSON
+    }
+    
+    // Find existing alert or create new one
+    int alert_index = find_alert_by_hash(filehash);
+    DuplicateAlert *alert;
+    
+    if (alert_index >= 0) {
+        // Update existing alert
+        alert = &g_alerts[alert_index];
+        memset(alert, 0, sizeof(DuplicateAlert));  // Clear and rebuild
+        strncpy(alert->filehash, filehash, 64);
+    } else {
+        // Create new alert
+        if (g_alert_count >= MAX_ALERTS) {
+            // Shift all alerts down by one (discard oldest)
+            for (int i = 0; i < MAX_ALERTS - 1; i++) {
+                g_alerts[i] = g_alerts[i + 1];
+            }
+            g_alert_count = MAX_ALERTS - 1;
+            
+            // Adjust current index if needed
+            if (g_current_alert_index > 0) {
+                g_current_alert_index--;
+            }
+        }
+        
+        alert = &g_alerts[g_alert_count];
+        memset(alert, 0, sizeof(DuplicateAlert));
+        strncpy(alert->filehash, filehash, 64);
+        g_alert_count++;
+        alert_index = g_alert_count - 1;
+    }
     
     // Parse trigger file
     const char *trigger_start = strstr(json, "\"trigger_file\":");
@@ -91,33 +207,45 @@ void ParseAlertJSON(const char *json) {
             if (filepath_end) {
                 size_t len = filepath_end - filepath;
                 if (len < MAX_PATH) {
-                    strncpy(g_current_alert.trigger_file.filepath, filepath, len);
-                    g_current_alert.trigger_file.filepath[len] = '\0';
+                    strncpy(alert->trigger_file.filepath, filepath, len);
+                    alert->trigger_file.filepath[len] = '\0';
                     
-                    // Extract filename from path
-                    const char *filename = strrchr(g_current_alert.trigger_file.filepath, '\\');
-                    filename = filename ? filename + 1 : g_current_alert.trigger_file.filepath;
-                    strncpy(g_current_alert.trigger_file.filename, filename, MAX_PATH - 1);
+                    const char *filename = strrchr(alert->trigger_file.filepath, '\\');
+                    filename = filename ? filename + 1 : alert->trigger_file.filepath;
+                    strncpy(alert->trigger_file.filename, filename, MAX_PATH - 1);
                 }
             }
         }
         
-        const char *filehash = strstr(trigger_start, "\"filehash\":\"");
-        if (filehash) {
-            filehash += 12;
-            const char *hash_end = strchr(filehash, '"');
+        const char *filehash_field = strstr(trigger_start, "\"filehash\":\"");
+        if (filehash_field && filehash_field < strstr(trigger_start, "},")) {
+            filehash_field += 12;
+            const char *hash_end = strchr(filehash_field, '"');
             if (hash_end) {
-                size_t len = hash_end - filehash;
+                size_t len = hash_end - filehash_field;
                 if (len < 65) {
-                    strncpy(g_current_alert.trigger_file.filehash, filehash, len);
-                    g_current_alert.trigger_file.filehash[len] = '\0';
+                    strncpy(alert->trigger_file.filehash, filehash_field, len);
+                    alert->trigger_file.filehash[len] = '\0';
                 }
             }
         }
         
         const char *filesize = strstr(trigger_start, "\"filesize\":");
-        if (filesize) {
-            sscanf(filesize + 11, "%llu", &g_current_alert.trigger_file.filesize);
+        if (filesize && filesize < strstr(trigger_start, "},")) {
+            sscanf(filesize + 11, "%llu", &alert->trigger_file.filesize);
+        }
+        
+        const char *last_mod = strstr(trigger_start, "\"last_mod\":\"");
+        if (last_mod && last_mod < strstr(trigger_start, "},")) {
+            last_mod += 12;
+            const char *mod_end = strchr(last_mod, '"');
+            if (mod_end) {
+                size_t len = mod_end - last_mod;
+                if (len < 32) {
+                    strncpy(alert->trigger_file.last_modified, last_mod, len);
+                    alert->trigger_file.last_modified[len] = '\0';
+                }
+            }
         }
     }
     
@@ -131,42 +259,81 @@ void ParseAlertJSON(const char *json) {
             dup = strstr(dup, "{\"filepath\":\"");
             if (!dup) break;
             
+            // Make sure we're still in the duplicates array
+            const char *array_end = strstr(duplicates_start, "],\"timestamp\"");
+            if (!array_end || dup > array_end) break;
+            
             dup += 13;
             const char *dup_end = strchr(dup, '"');
             if (dup_end) {
                 size_t len = dup_end - dup;
                 if (len < MAX_PATH) {
-                    strncpy(g_current_alert.duplicates[count].filepath, dup, len);
-                    g_current_alert.duplicates[count].filepath[len] = '\0';
+                    strncpy(alert->duplicates[count].filepath, dup, len);
+                    alert->duplicates[count].filepath[len] = '\0';
                     
-                    const char *filename = strrchr(g_current_alert.duplicates[count].filepath, '\\');
-                    filename = filename ? filename + 1 : g_current_alert.duplicates[count].filepath;
-                    strncpy(g_current_alert.duplicates[count].filename, filename, MAX_PATH - 1);
+                    const char *filename = strrchr(alert->duplicates[count].filepath, '\\');
+                    filename = filename ? filename + 1 : alert->duplicates[count].filepath;
+                    strncpy(alert->duplicates[count].filename, filename, MAX_PATH - 1);
                 }
             }
             
+            const char *next_brace = strchr(dup, '}');
+            if (!next_brace) break;
+            
             const char *size_str = strstr(dup, "\"filesize\":");
-            if (size_str) {
-                sscanf(size_str + 11, "%llu", &g_current_alert.duplicates[count].filesize);
+            if (size_str && size_str < next_brace) {
+                sscanf(size_str + 11, "%llu", &alert->duplicates[count].filesize);
+            }
+            
+            const char *last_mod = strstr(dup, "\"last_mod\":\"");
+            if (last_mod && last_mod < next_brace) {
+                last_mod += 12;
+                const char *mod_end = strchr(last_mod, '"');
+                if (mod_end && mod_end < next_brace) {
+                    size_t len = mod_end - last_mod;
+                    if (len < 32) {
+                        strncpy(alert->duplicates[count].last_modified, last_mod, len);
+                        alert->duplicates[count].last_modified[len] = '\0';
+                    }
+                }
             }
             
             count++;
-            dup = dup_end;
+            dup = next_brace + 1;
         }
         
-        g_current_alert.duplicate_count = count;
+        alert->duplicate_count = count;
     }
+    
+    // Parse timestamp
+    const char *timestamp_start = strstr(json, "\"timestamp\":\"");
+    if (timestamp_start) {
+        timestamp_start += 13;
+        const char *timestamp_end = strchr(timestamp_start, '"');
+        if (timestamp_end) {
+            size_t len = timestamp_end - timestamp_start;
+            if (len < 32) {
+                strncpy(alert->timestamp, timestamp_start, len);
+                alert->timestamp[len] = '\0';
+            }
+        }
+    }
+    
+    // Count remaining files
+    alert->files_remaining = CountRemainingFiles(alert);
+    
+    // Set current view to this alert (newest/updated)
+    g_current_alert_index = alert_index;
     
     LeaveCriticalSection(&g_alert_lock);
 }
 
-// Pipe reader thread - uses overlapped I/O for non-blocking reads
+// Pipe reader thread
 DWORD WINAPI PipeReaderThread(LPVOID param) {
     (void)param;
     char buffer[65536];
     
     while (g_running) {
-        // Connect to pipe
         g_hPipe = CreateFile(
             PIPE_NAME,
             GENERIC_READ | GENERIC_WRITE,
@@ -186,20 +353,16 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
             continue;
         }
         
-        // Set message mode
         DWORD mode = PIPE_READMODE_MESSAGE;
         SetNamedPipeHandleState(g_hPipe, &mode, NULL, NULL);
         
-        // Create event for overlapped I/O
         OVERLAPPED overlapped = {0};
         overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         
-        // Read messages with timeout
         while (g_running) {
             DWORD bytes_read;
             ResetEvent(overlapped.hEvent);
             
-            // Start async read
             BOOL success = ReadFile(g_hPipe, buffer, sizeof(buffer) - 1, &bytes_read, &overlapped);
             DWORD error = GetLastError();
             
@@ -207,10 +370,23 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
                 break;
             }
             
-            // Wait for read to complete or timeout (100ms)
-            DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 100);
+            if (success && bytes_read > 0) {
+                buffer[bytes_read] = '\0';
+                
+                if (strstr(buffer, "\"type\":\"ALERT\"") && strstr(buffer, "\"DUPLICATE_DETECTED\"")) {
+                    ParseAlertJSON(buffer);
+                    PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 0, 0);
+                } else if (strstr(buffer, "\"SCAN_COMPLETE\"")) {
+                    PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 1, 0);
+                }
+                
+                continue;
+            }
+            
+            DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 1000);
             
             if (wait_result == WAIT_TIMEOUT) {
+                CancelIo(g_hPipe);
                 continue;
             }
             
@@ -218,7 +394,6 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
                 break;
             }
             
-            // Get result
             if (!GetOverlappedResult(g_hPipe, &overlapped, &bytes_read, FALSE)) {
                 break;
             }
@@ -229,7 +404,6 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
             
             buffer[bytes_read] = '\0';
             
-            // Check message type and post to main window
             if (strstr(buffer, "\"type\":\"ALERT\"") && strstr(buffer, "\"DUPLICATE_DETECTED\"")) {
                 ParseAlertJSON(buffer);
                 PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 0, 0);
@@ -241,6 +415,12 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
         CloseHandle(overlapped.hEvent);
         CloseHandle(g_hPipe);
         g_hPipe = INVALID_HANDLE_VALUE;
+        
+        if (!g_running) {
+            break;
+        }
+        
+        Sleep(1000);
     }
     
     return 0;
@@ -262,23 +442,127 @@ void ShowTrayNotification(const char *title, const char *message) {
     Shell_NotifyIcon(NIM_MODIFY, &nid);
 }
 
+// Update report window
+void UpdateReportWindow(void) {
+    if (!g_hReportWnd) return;
+    
+    HWND hListView = GetDlgItem(g_hReportWnd, 2001);
+    ListView_DeleteAllItems(hListView);
+    
+    EnterCriticalSection(&g_alert_lock);
+    
+    if (g_alert_count == 0) {
+        SetDlgItemText(g_hReportWnd, 2005, "No duplicate alerts");
+        SetDlgItemText(g_hReportWnd, 2007, "");
+        LeaveCriticalSection(&g_alert_lock);
+        return;
+    }
+    
+    // Find a valid group to display (with at least 2 files remaining)
+    int valid_group_found = 0;
+    int search_index = g_current_alert_index;
+    
+    for (int i = 0; i < g_alert_count; i++) {
+        DuplicateAlert *alert = &g_alerts[search_index];
+        int remaining = CountRemainingFiles(alert);
+        
+        if (remaining >= 2) {
+            g_current_alert_index = search_index;
+            valid_group_found = 1;
+            break;
+        }
+        
+        search_index = (search_index + 1) % g_alert_count;
+    }
+    
+    if (!valid_group_found) {
+        SetDlgItemText(g_hReportWnd, 2005, "All duplicate groups have been resolved");
+        SetDlgItemText(g_hReportWnd, 2007, "");
+        LeaveCriticalSection(&g_alert_lock);
+        return;
+    }
+    
+    DuplicateAlert *alert = &g_alerts[g_current_alert_index];
+    
+    // Count valid groups
+    int valid_groups = 0;
+    for (int i = 0; i < g_alert_count; i++) {
+        if (CountRemainingFiles(&g_alerts[i]) >= 2) {
+            valid_groups++;
+        }
+    }
+    
+    // Update navigation text
+    char nav_text[150];
+    snprintf(nav_text, sizeof(nav_text), "Group %d of %d (%d files remaining) - Hash: %.8s...", 
+             g_current_alert_index + 1, g_alert_count, alert->files_remaining, alert->filehash);
+    SetDlgItemText(g_hReportWnd, 2007, nav_text);
+    
+    BOOL trigger_exists = FileExists(alert->trigger_file.filepath);
+    
+    // Display trigger file
+    if (trigger_exists) {
+        char trigger_text[MAX_PATH + 100];
+        char size_str[64];
+        format_file_size(alert->trigger_file.filesize, size_str, sizeof(size_str));
+        snprintf(trigger_text, sizeof(trigger_text), "%s (%s)", 
+                alert->trigger_file.filepath, size_str);
+        SetDlgItemText(g_hReportWnd, 2005, trigger_text);
+    } else {
+        char temp[MAX_PATH + 30];
+        snprintf(temp, sizeof(temp), "[DELETED] %s", alert->trigger_file.filepath);
+        SetDlgItemText(g_hReportWnd, 2005, temp);
+    }
+    
+    // Add duplicate files to listview (only those that still exist)
+    int valid_index = 0;
+    for (int i = 0; i < alert->duplicate_count; i++) {
+        if (FileExists(alert->duplicates[i].filepath)) {
+            LVITEM lvi = {0};
+            lvi.mask = LVIF_TEXT;
+            lvi.iItem = valid_index;
+            lvi.iSubItem = 0;
+            lvi.pszText = alert->duplicates[i].filepath;
+            ListView_InsertItem(hListView, &lvi);
+            
+            char size_str[64];
+            format_file_size(alert->duplicates[i].filesize, size_str, sizeof(size_str));
+            ListView_SetItemText(hListView, valid_index, 1, size_str);
+            
+            ListView_SetItemText(hListView, valid_index, 2, "Duplicate");
+            
+            if (strlen(alert->duplicates[i].last_modified) > 0) {
+                ListView_SetItemText(hListView, valid_index, 3, alert->duplicates[i].last_modified);
+            } else {
+                ListView_SetItemText(hListView, valid_index, 3, "Unknown");
+            }
+            
+            valid_index++;
+        }
+    }
+    
+    if (valid_index == 0 && !trigger_exists) {
+        SetDlgItemText(g_hReportWnd, 2005, "All files in this group have been deleted");
+    }
+    
+    LeaveCriticalSection(&g_alert_lock);
+}
+
 // Report Window Procedure
 LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            // Create controls
             HWND hList = CreateWindowEx(
                 0, WC_LISTVIEW, "",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
-                10, 50, 760, 400,
+                10, 70, 760, 380,
                 hwnd, (HMENU)2001, GetModuleHandle(NULL), NULL
             );
             
-            // Setup columns
             LVCOLUMN lvc = {0};
             lvc.mask = LVCF_TEXT | LVCF_WIDTH;
             
-            lvc.pszText = "File";
+            lvc.pszText = "File Path";
             lvc.cx = 400;
             ListView_InsertColumn(hList, 0, &lvc);
             
@@ -294,24 +578,30 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             lvc.cx = 140;
             ListView_InsertColumn(hList, 3, &lvc);
             
-            // Create buttons
-            CreateWindow("BUTTON", "Open File Location",
+            CreateWindow("BUTTON", "Previous Group",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        10, 460, 150, 30, hwnd, (HMENU)2002, GetModuleHandle(NULL), NULL);
+                        10, 460, 120, 30, hwnd, (HMENU)2008, GetModuleHandle(NULL), NULL);
+            
+            CreateWindow("BUTTON", "Next Group",
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        140, 460, 120, 30, hwnd, (HMENU)2009, GetModuleHandle(NULL), NULL);
+            
+            CreateWindow("BUTTON", "Open Location",
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        280, 460, 150, 30, hwnd, (HMENU)2002, GetModuleHandle(NULL), NULL);
             
             CreateWindow("BUTTON", "Delete Selected",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        170, 460, 150, 30, hwnd, (HMENU)2003, GetModuleHandle(NULL), NULL);
+                        440, 460, 150, 30, hwnd, (HMENU)2003, GetModuleHandle(NULL), NULL);
             
             CreateWindow("BUTTON", "Refresh",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        330, 460, 100, 30, hwnd, (HMENU)2006, GetModuleHandle(NULL), NULL);
+                        600, 460, 80, 30, hwnd, (HMENU)2006, GetModuleHandle(NULL), NULL);
             
             CreateWindow("BUTTON", "Close",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        620, 460, 150, 30, hwnd, (HMENU)2004, GetModuleHandle(NULL), NULL);
+                        690, 460, 80, 30, hwnd, (HMENU)2004, GetModuleHandle(NULL), NULL);
             
-            // Static text for info
             CreateWindow("STATIC", "Trigger File:",
                         WS_CHILD | WS_VISIBLE | SS_LEFT,
                         10, 10, 100, 20, hwnd, NULL, GetModuleHandle(NULL), NULL);
@@ -320,12 +610,15 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                         WS_CHILD | WS_VISIBLE | SS_LEFT,
                         120, 10, 650, 20, hwnd, (HMENU)2005, GetModuleHandle(NULL), NULL);
             
+            CreateWindow("STATIC", "",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        10, 35, 760, 20, hwnd, (HMENU)2007, GetModuleHandle(NULL), NULL);
+            
             CreateWindow("STATIC", "Duplicate Files (same content):",
                         WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        10, 30, 760, 20, hwnd, NULL, GetModuleHandle(NULL), NULL);
+                        10, 50, 760, 20, hwnd, NULL, GetModuleHandle(NULL), NULL);
             
-            // Populate list
-            PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(2006, 0), 0);  // Trigger refresh
+            PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(2006, 0), 0);
             break;
         }
         
@@ -333,56 +626,29 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             int wmId = LOWORD(wParam);
             
             switch (wmId) {
-                case 2006: {  // Refresh button
-                    HWND hListView = GetDlgItem(hwnd, 2001);
-                    ListView_DeleteAllItems(hListView);
-                    
+                case 2008: {  // Previous Group
                     EnterCriticalSection(&g_alert_lock);
-                    
-                    // Check if trigger file still exists
-                    BOOL trigger_exists = FileExists(g_current_alert.trigger_file.filepath);
-                    
-                    if (trigger_exists) {
-                        SetDlgItemText(hwnd, 2005, g_current_alert.trigger_file.filepath);
-                    } else {
-                        SetDlgItemText(hwnd, 2005, "[DELETED] ");
-                        char temp[MAX_PATH + 20];
-                        snprintf(temp, sizeof(temp), "[DELETED] %s", g_current_alert.trigger_file.filepath);
-                        SetDlgItemText(hwnd, 2005, temp);
-                    }
-                    
-                    // Add only files that still exist
-                    int valid_index = 0;
-                    for (int i = 0; i < g_current_alert.duplicate_count; i++) {
-                        if (FileExists(g_current_alert.duplicates[i].filepath)) {
-                            LVITEM lvi = {0};
-                            lvi.mask = LVIF_TEXT;
-                            lvi.iItem = valid_index;
-                            lvi.iSubItem = 0;
-                            lvi.pszText = g_current_alert.duplicates[i].filepath;
-                            ListView_InsertItem(hListView, &lvi);
-                            
-                            char size_str[64];
-                            format_file_size(g_current_alert.duplicates[i].filesize, size_str, sizeof(size_str));
-                            ListView_SetItemText(hListView, valid_index, 1, size_str);
-                            
-                            ListView_SetItemText(hListView, valid_index, 2, "Duplicate");
-                            ListView_SetItemText(hListView, valid_index, 3, g_current_alert.duplicates[i].last_modified);
-                            
-                            valid_index++;
-                        }
-                    }
-                    
-                    if (valid_index == 0) {
-                        // No files left
-                        SetDlgItemText(hwnd, 2005, "All files have been deleted");
-                    }
-                    
+                    int new_index = FindNextValidGroup(g_current_alert_index, -1);
+                    g_current_alert_index = new_index;
                     LeaveCriticalSection(&g_alert_lock);
+                    UpdateReportWindow();
                     break;
                 }
                 
-                case 2002: { // Open File Location
+                case 2009: {  // Next Group
+                    EnterCriticalSection(&g_alert_lock);
+                    int new_index = FindNextValidGroup(g_current_alert_index, 1);
+                    g_current_alert_index = new_index;
+                    LeaveCriticalSection(&g_alert_lock);
+                    UpdateReportWindow();
+                    break;
+                }
+                
+                case 2006:  // Refresh
+                    UpdateReportWindow();
+                    break;
+                
+                case 2002: {  // Open File Location
                     HWND hListView = GetDlgItem(hwnd, 2001);
                     int selected = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
                     
@@ -396,8 +662,7 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                             ShellExecute(NULL, "open", "explorer.exe", command, NULL, SW_SHOW);
                         } else {
                             MessageBox(hwnd, "File no longer exists!", "Error", MB_OK | MB_ICONERROR);
-                            // Refresh the list
-                            PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(2006, 0), 0);
+                            UpdateReportWindow();
                         }
                     } else {
                         MessageBox(hwnd, "Please select a file first.", "Info", MB_OK | MB_ICONINFORMATION);
@@ -405,7 +670,7 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     break;
                 }
                 
-                case 2003: { // Delete Selected
+                case 2003: {  // Delete Selected
                     HWND hListView = GetDlgItem(hwnd, 2001);
                     int selected = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
                     
@@ -413,10 +678,9 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                         char filepath[MAX_PATH];
                         ListView_GetItemText(hListView, selected, 0, filepath, MAX_PATH);
                         
-                        // Check if file exists first
                         if (!FileExists(filepath)) {
                             MessageBox(hwnd, "File has already been deleted.", "Info", MB_OK | MB_ICONINFORMATION);
-                            PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(2006, 0), 0);  // Refresh
+                            UpdateReportWindow();
                             break;
                         }
                         
@@ -426,7 +690,6 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                                 filepath);
                         
                         if (MessageBox(hwnd, msg, "Confirm Delete", MB_YESNO | MB_ICONWARNING) == IDYES) {
-                            // Double-null terminated string for SHFileOperation
                             char from_path[MAX_PATH + 2];
                             memset(from_path, 0, sizeof(from_path));
                             strncpy(from_path, filepath, MAX_PATH);
@@ -442,14 +705,12 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                             
                             if (result == 0 && !fileOp.fAnyOperationsAborted) {
                                 MessageBox(hwnd, "File moved to Recycle Bin.", "Success", MB_OK | MB_ICONINFORMATION);
-                                // Refresh the list to remove deleted file
-                                PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(2006, 0), 0);
+                                UpdateReportWindow();
                             } else {
-                                // Check if file was actually deleted despite error code
-                                Sleep(100);  // Give Windows time to update
+                                Sleep(100);
                                 if (!FileExists(filepath)) {
                                     MessageBox(hwnd, "File was successfully deleted.", "Success", MB_OK | MB_ICONINFORMATION);
-                                    PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(2006, 0), 0);
+                                    UpdateReportWindow();
                                 } else {
                                     char error_msg[256];
                                     snprintf(error_msg, sizeof(error_msg), 
@@ -465,7 +726,7 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     break;
                 }
                 
-                case 2004: // Close
+                case 2004:  // Close
                     DestroyWindow(hwnd);
                     g_hReportWnd = NULL;
                     break;
@@ -490,6 +751,7 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 void ShowReportWindow(void) {
     if (g_hReportWnd) {
         SetForegroundWindow(g_hReportWnd);
+        UpdateReportWindow();
         return;
     }
     
@@ -506,7 +768,7 @@ void ShowReportWindow(void) {
     }
     
     g_hReportWnd = CreateWindowEx(
-        0, "DDASReportWindow", "DDAS - Duplicate File Report",
+        0, "DDASReportWindow", "DDAS - Duplicate File Groups",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 550,
         NULL, NULL, GetModuleHandle(NULL), NULL
@@ -521,7 +783,6 @@ void ShowReportWindow(void) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
-            // Setup tray icon
             g_nid.cbSize = sizeof(NOTIFYICONDATA);
             g_nid.hWnd = hwnd;
             g_nid.uID = 1;
@@ -533,28 +794,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         
         case WM_PIPE_MESSAGE:
-            // Message from pipe thread
             if (wParam == 0) {
                 // Duplicate detected
                 EnterCriticalSection(&g_alert_lock);
-                char notification[512];
-                snprintf(notification, sizeof(notification), 
-                        "Duplicate found: %s\n%d matching file(s)",
-                        g_current_alert.trigger_file.filename,
-                        g_current_alert.duplicate_count);
-                LeaveCriticalSection(&g_alert_lock);
-                
-                ShowTrayNotification("DDAS - Duplicate Detected", notification);
+                if (g_alert_count > 0) {
+                    DuplicateAlert *alert = &g_alerts[g_current_alert_index];
+                    char notification[512];
+                    snprintf(notification, sizeof(notification), 
+                            "Duplicate group updated: %s\n%d file(s) with same content",
+                            alert->trigger_file.filename,
+                            alert->files_remaining);
+                    LeaveCriticalSection(&g_alert_lock);
+                    
+                    ShowTrayNotification("DDAS - Duplicate Group", notification);
+                    
+                    if (g_hReportWnd) {
+                        UpdateReportWindow();
+                    }
+                } else {
+                    LeaveCriticalSection(&g_alert_lock);
+                }
             } else if (wParam == 1) {
                 // Scan complete
-                ShowTrayNotification("DDAS", "Initial scan complete");
+                EnterCriticalSection(&g_alert_lock);
+                int count = g_alert_count;
+                LeaveCriticalSection(&g_alert_lock);
+                
+                char notification[256];
+                snprintf(notification, sizeof(notification), 
+                        "Initial scan complete. Found %d duplicate group(s).", count);
+                ShowTrayNotification("DDAS", notification);
             }
             break;
         
         case WM_TRAYICON:
             if (lParam == WM_LBUTTONDBLCLK) {
-                // Double-click on tray icon - show report
-                if (g_current_alert.duplicate_count > 0) {
+                EnterCriticalSection(&g_alert_lock);
+                int has_alerts = (g_alert_count > 0);
+                LeaveCriticalSection(&g_alert_lock);
+                
+                if (has_alerts) {
                     ShowReportWindow();
                 }
             } else if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
@@ -562,7 +841,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 GetCursorPos(&pt);
                 
                 HMENU hMenu = CreatePopupMenu();
-                AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW_WINDOW, "Show Last Alert");
+                AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW_WINDOW, "Show Alerts");
                 AppendMenu(hMenu, MF_STRING, ID_TRAY_ABOUT, "About");
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT, "Exit");
@@ -577,9 +856,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
                 case ID_TRAY_SHOW_WINDOW:
-                    if (g_current_alert.duplicate_count > 0) {
+                    EnterCriticalSection(&g_alert_lock);
+                    if (g_alert_count > 0) {
+                        LeaveCriticalSection(&g_alert_lock);
                         ShowReportWindow();
                     } else {
+                        LeaveCriticalSection(&g_alert_lock);
                         MessageBox(NULL, "No duplicates detected yet.", "DDAS", MB_OK | MB_ICONINFORMATION);
                     }
                     break;
@@ -587,8 +869,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case ID_TRAY_ABOUT:
                     MessageBox(NULL, 
                               "DDAS - Duplicate Detection & Alert System\n"
-                              "Version 1.0\n\n"
-                              "Real-time file duplicate detection with GUI alerts.",
+                              "Version 2.0 - Group-Based Tracking\n\n"
+                              "Tracks duplicate file groups.\n"
+                              "Updates groups when new duplicates are detected.",
                               "About DDAS", MB_OK | MB_ICONINFORMATION);
                     break;
                 
@@ -619,7 +902,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     InitializeCriticalSection(&g_alert_lock);
     InitCommonControls();
     
-    // Register window class
+    memset(g_alerts, 0, sizeof(g_alerts));
+    g_alert_count = 0;
+    g_current_alert_index = 0;
+    
     WNDCLASSEX wc = {0};
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.lpfnWndProc = WndProc;
@@ -631,7 +917,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 0;
     }
     
-    // Create hidden window for tray icon
     g_hMainWnd = CreateWindowEx(
         0, "DDASTrayClass", "DDAS Tray",
         0, 0, 0, 0, 0,
@@ -643,17 +928,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 0;
     }
     
-    // Start pipe reader thread
     g_hPipeThread = CreateThread(NULL, 0, PipeReaderThread, NULL, 0, NULL);
     
-    // Message loop
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
     
-    // Cleanup
     g_running = FALSE;
     if (g_hPipeThread) {
         WaitForSingleObject(g_hPipeThread, 2000);
