@@ -442,80 +442,111 @@ void ShowTrayNotification(const char *title, const char *message) {
     Shell_NotifyIcon(NIM_MODIFY, &nid);
 }
 
+void CompactAlerts(void) {
+    int write = 0;
+    for (int read = 0; read < g_alert_count; read++) {
+        int remaining = CountRemainingFiles(&g_alerts[read]);
+        if (remaining >= 2) {
+            if (write != read) {
+                g_alerts[write] = g_alerts[read];
+            }
+            write++;
+        }
+    }
+    g_alert_count = write;
+
+    if (g_alert_count == 0) {
+        g_current_alert_index = 0;
+    } else if (g_current_alert_index >= g_alert_count) {
+        g_current_alert_index = g_alert_count - 1;
+    }
+}
+
+// Promote first remaining duplicate to trigger file after trigger is deleted
+void PromoteDuplicate(DuplicateAlert *alert) {
+    // Find first duplicate that still exists
+    int promote_index = -1;
+    for (int i = 0; i < alert->duplicate_count; i++) {
+        if (FileExists(alert->duplicates[i].filepath)) {
+            promote_index = i;
+            break;
+        }
+    }
+
+    if (promote_index == -1) {
+        // No duplicates remain either, group will be cleaned up on Refresh
+        return;
+    }
+
+    // Copy promoted duplicate into trigger_file slot
+    alert->trigger_file = alert->duplicates[promote_index];
+    // Copy the group hash back since FileInfo doesn't carry it
+    strncpy(alert->trigger_file.filehash, alert->filehash, 64);
+    alert->trigger_file.filehash[64] = '\0';
+
+    // Shift remaining duplicates down to fill the gap
+    for (int i = promote_index; i < alert->duplicate_count - 1; i++) {
+        alert->duplicates[i] = alert->duplicates[i + 1];
+    }
+    alert->duplicate_count--;
+
+    // Clear the now-vacant last slot
+    memset(&alert->duplicates[alert->duplicate_count], 0, sizeof(FileInfo));
+}
+
 // Update report window
 void UpdateReportWindow(void) {
     if (!g_hReportWnd) return;
-    
+
     HWND hListView = GetDlgItem(g_hReportWnd, 2001);
     ListView_DeleteAllItems(hListView);
-    
+
     EnterCriticalSection(&g_alert_lock);
-    
+
     if (g_alert_count == 0) {
         SetDlgItemText(g_hReportWnd, 2005, "No duplicate alerts");
         SetDlgItemText(g_hReportWnd, 2007, "");
         LeaveCriticalSection(&g_alert_lock);
         return;
     }
-    
-    // Find a valid group to display (with at least 2 files remaining)
-    int valid_group_found = 0;
-    int search_index = g_current_alert_index;
-    
-    for (int i = 0; i < g_alert_count; i++) {
-        DuplicateAlert *alert = &g_alerts[search_index];
-        int remaining = CountRemainingFiles(alert);
-        
-        if (remaining >= 2) {
-            g_current_alert_index = search_index;
-            valid_group_found = 1;
-            break;
-        }
-        
-        search_index = (search_index + 1) % g_alert_count;
-    }
-    
-    if (!valid_group_found) {
-        SetDlgItemText(g_hReportWnd, 2005, "All duplicate groups have been resolved");
-        SetDlgItemText(g_hReportWnd, 2007, "");
-        LeaveCriticalSection(&g_alert_lock);
-        return;
-    }
-    
+
     DuplicateAlert *alert = &g_alerts[g_current_alert_index];
-    
-    // Count valid groups
-    int valid_groups = 0;
-    for (int i = 0; i < g_alert_count; i++) {
-        if (CountRemainingFiles(&g_alerts[i]) >= 2) {
-            valid_groups++;
-        }
-    }
-    
+
     // Update navigation text
     char nav_text[150];
-    snprintf(nav_text, sizeof(nav_text), "Group %d of %d (%d files remaining) - Hash: %.8s...", 
+    snprintf(nav_text, sizeof(nav_text), "Group %d of %d (%d files remaining) - Hash: %.8s...",
              g_current_alert_index + 1, g_alert_count, alert->files_remaining, alert->filehash);
     SetDlgItemText(g_hReportWnd, 2007, nav_text);
-    
-    BOOL trigger_exists = FileExists(alert->trigger_file.filepath);
-    
-    // Display trigger file
-    if (trigger_exists) {
-        char trigger_text[MAX_PATH + 100];
+
+    // Clear trigger file label - we now show everything in the listview
+    SetDlgItemText(g_hReportWnd, 2005, "(see list below - first entry is the trigger file)");
+
+    // Add trigger file first (if it exists)
+    int valid_index = 0;
+
+    if (FileExists(alert->trigger_file.filepath)) {
+        LVITEM lvi = {0};
+        lvi.mask = LVIF_TEXT;
+        lvi.iItem = valid_index;
+        lvi.iSubItem = 0;
+        lvi.pszText = alert->trigger_file.filepath;
+        ListView_InsertItem(hListView, &lvi);
+
         char size_str[64];
         format_file_size(alert->trigger_file.filesize, size_str, sizeof(size_str));
-        snprintf(trigger_text, sizeof(trigger_text), "%s (%s)", 
-                alert->trigger_file.filepath, size_str);
-        SetDlgItemText(g_hReportWnd, 2005, trigger_text);
-    } else {
-        char temp[MAX_PATH + 30];
-        snprintf(temp, sizeof(temp), "[DELETED] %s", alert->trigger_file.filepath);
-        SetDlgItemText(g_hReportWnd, 2005, temp);
+        ListView_SetItemText(hListView, valid_index, 1, size_str);
+        ListView_SetItemText(hListView, valid_index, 2, "Trigger");
+
+        if (strlen(alert->trigger_file.last_modified) > 0) {
+            ListView_SetItemText(hListView, valid_index, 3, alert->trigger_file.last_modified);
+        } else {
+            ListView_SetItemText(hListView, valid_index, 3, "Unknown");
+        }
+
+        valid_index++;
     }
-    
-    // Add duplicate files to listview (only those that still exist)
-    int valid_index = 0;
+
+    // Add duplicate files
     for (int i = 0; i < alert->duplicate_count; i++) {
         if (FileExists(alert->duplicates[i].filepath)) {
             LVITEM lvi = {0};
@@ -524,28 +555,37 @@ void UpdateReportWindow(void) {
             lvi.iSubItem = 0;
             lvi.pszText = alert->duplicates[i].filepath;
             ListView_InsertItem(hListView, &lvi);
-            
+
             char size_str[64];
             format_file_size(alert->duplicates[i].filesize, size_str, sizeof(size_str));
             ListView_SetItemText(hListView, valid_index, 1, size_str);
-            
             ListView_SetItemText(hListView, valid_index, 2, "Duplicate");
-            
+
             if (strlen(alert->duplicates[i].last_modified) > 0) {
                 ListView_SetItemText(hListView, valid_index, 3, alert->duplicates[i].last_modified);
             } else {
                 ListView_SetItemText(hListView, valid_index, 3, "Unknown");
             }
-            
+
             valid_index++;
         }
     }
-    
-    if (valid_index == 0 && !trigger_exists) {
-        SetDlgItemText(g_hReportWnd, 2005, "All files in this group have been deleted");
-    }
-    
+
     LeaveCriticalSection(&g_alert_lock);
+}
+
+void RemoveAlertAt(int index) {
+    for (int i = index; i < g_alert_count - 1; i++) {
+        g_alerts[i] = g_alerts[i + 1];
+    }
+    memset(&g_alerts[g_alert_count - 1], 0, sizeof(DuplicateAlert));
+    g_alert_count--;
+
+    if (g_alert_count == 0) {
+        g_current_alert_index = 0;
+    } else if (g_current_alert_index >= g_alert_count) {
+        g_current_alert_index = g_alert_count - 1;
+    }
 }
 
 // Report Window Procedure
@@ -645,6 +685,9 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 }
                 
                 case 2006:  // Refresh
+                    EnterCriticalSection(&g_alert_lock);
+                    CompactAlerts();
+                    LeaveCriticalSection(&g_alert_lock);
                     UpdateReportWindow();
                     break;
                 
@@ -673,51 +716,84 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 case 2003: {  // Delete Selected
                     HWND hListView = GetDlgItem(hwnd, 2001);
                     int selected = ListView_GetNextItem(hListView, -1, LVNI_SELECTED);
-                    
+
                     if (selected != -1) {
                         char filepath[MAX_PATH];
                         ListView_GetItemText(hListView, selected, 0, filepath, MAX_PATH);
-                        
+
                         if (!FileExists(filepath)) {
                             MessageBox(hwnd, "File has already been deleted.", "Info", MB_OK | MB_ICONINFORMATION);
                             UpdateReportWindow();
                             break;
                         }
-                        
-                        char msg[MAX_PATH + 100];
-                        snprintf(msg, sizeof(msg), 
-                                "Delete this file?\n\n%s\n\nThis will move it to Recycle Bin.",
-                                filepath);
-                        
+
+                        // Check if selected file is the trigger file
+                        EnterCriticalSection(&g_alert_lock);
+                        DuplicateAlert *alert = &g_alerts[g_current_alert_index];
+                        BOOL is_trigger = (strcmp(filepath, alert->trigger_file.filepath) == 0);
+                        LeaveCriticalSection(&g_alert_lock);
+
+                        char msg[MAX_PATH + 150];
+                        if (is_trigger) {
+                            snprintf(msg, sizeof(msg),
+                                    "Delete this TRIGGER file?\n\n%s\n\n"
+                                    "This will move it to Recycle Bin.\n"
+                                    "The next duplicate will become the new trigger.",
+                                    filepath);
+                        } else {
+                            snprintf(msg, sizeof(msg),
+                                    "Delete this file?\n\n%s\n\nThis will move it to Recycle Bin.",
+                                    filepath);
+                        }
+
                         if (MessageBox(hwnd, msg, "Confirm Delete", MB_YESNO | MB_ICONWARNING) == IDYES) {
                             char from_path[MAX_PATH + 2];
                             memset(from_path, 0, sizeof(from_path));
                             strncpy(from_path, filepath, MAX_PATH);
-                            
+
                             SHFILEOPSTRUCT fileOp = {0};
                             fileOp.hwnd = hwnd;
                             fileOp.wFunc = FO_DELETE;
                             fileOp.pFrom = from_path;
                             fileOp.pTo = NULL;
                             fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
-                            
+
                             int result = SHFileOperation(&fileOp);
-                            
-                            if (result == 0 && !fileOp.fAnyOperationsAborted) {
+
+                            BOOL deleted = (result == 0 && !fileOp.fAnyOperationsAborted);
+                            if (!deleted) {
+                                Sleep(100);
+                                deleted = !FileExists(filepath);
+                            }
+
+                            if (deleted) {
+                                EnterCriticalSection(&g_alert_lock);
+
+                                int cur = g_current_alert_index;
+
+                                // If trigger was deleted, promote next duplicate first
+                                if (is_trigger) {
+                                    PromoteDuplicate(&g_alerts[cur]);
+                                }
+
+                                // Recount and auto-remove group if only 1 file remains
+                                int remaining = CountRemainingFiles(&g_alerts[cur]);
+                                if (remaining <= 1) {
+                                    RemoveAlertAt(cur);
+                                } else {
+                                    g_alerts[cur].files_remaining = remaining;
+                                }
+
+                                LeaveCriticalSection(&g_alert_lock);
+
                                 MessageBox(hwnd, "File moved to Recycle Bin.", "Success", MB_OK | MB_ICONINFORMATION);
                                 UpdateReportWindow();
                             } else {
-                                Sleep(100);
-                                if (!FileExists(filepath)) {
-                                    MessageBox(hwnd, "File was successfully deleted.", "Success", MB_OK | MB_ICONINFORMATION);
-                                    UpdateReportWindow();
-                                } else {
-                                    char error_msg[256];
-                                    snprintf(error_msg, sizeof(error_msg), 
-                                            "Failed to delete file.\nError code: %d\n\nThe file may be locked or in use.", 
-                                            result);
-                                    MessageBox(hwnd, error_msg, "Error", MB_OK | MB_ICONERROR);
-                                }
+                                char error_msg[256];
+                                snprintf(error_msg, sizeof(error_msg),
+                                        "Failed to delete file.\nError code: %d\n\nThe file may be locked or in use.",
+                                        result);
+                                MessageBox(hwnd, error_msg, "Error", MB_OK | MB_ICONERROR);
                             }
                         }
                     } else {
