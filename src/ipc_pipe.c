@@ -393,22 +393,52 @@ static DWORD WINAPI pipe_server_thread(LPVOID param) {
 // Handle incoming commands from GUI client
 static void handle_client_commands(HANDLE pipe) {
     char buffer[PIPE_BUFFER_SIZE];
-    DWORD bytes_read;
-    
+    OVERLAPPED ov = {0};
+    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
     while (g_pipe_server->running && g_pipe_server->client_connected) {
-        BOOL success = ReadFile(pipe, buffer, sizeof(buffer) - 1, &bytes_read, NULL);
-        
-        if (!success || bytes_read == 0) {
-            break;
+        DWORD bytes_read;
+        ResetEvent(ov.hEvent);
+
+        BOOL success = ReadFile(pipe, buffer, sizeof(buffer) - 1, &bytes_read, &ov);
+        DWORD error = GetLastError();
+
+        if (!success && error != ERROR_IO_PENDING) {
+            break; // Pipe broken
         }
-        
+
+        if (success) {
+            // Completed synchronously
+            if (bytes_read == 0) break;
+            buffer[bytes_read] = '\0';
+            safe_printf("[IPC] Received command: %s\n", buffer);
+            const char *response = "{\"type\":\"RESPONSE\",\"status\":\"OK\",\"message\":\"Command received\"}\n";
+            DWORD bytes_written;
+            WriteFile(pipe, response, strlen(response), &bytes_written, NULL);
+            continue;
+        }
+
+        DWORD wait = WaitForSingleObject(ov.hEvent, 30000);
+
+        if (wait == WAIT_TIMEOUT) {
+            CancelIo(pipe);
+            continue;
+        }
+
+        if (wait != WAIT_OBJECT_0) break;
+
+        if (!GetOverlappedResult(pipe, &ov, &bytes_read, FALSE)) break;
+        if (bytes_read == 0) break;
+
         buffer[bytes_read] = '\0';
         safe_printf("[IPC] Received command: %s\n", buffer);
-        
         const char *response = "{\"type\":\"RESPONSE\",\"status\":\"OK\",\"message\":\"Command received\"}\n";
         DWORD bytes_written;
         WriteFile(pipe, response, strlen(response), &bytes_written, NULL);
     }
+
+    CancelIo(pipe);
+    CloseHandle(ov.hEvent);
 }
 
 // Send message to connected GUI client

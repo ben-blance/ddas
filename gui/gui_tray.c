@@ -383,10 +383,15 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
                 continue;
             }
             
-            DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 1000);
+            // Wait up to 10 s for the next message.  On timeout, just loop
+            // and re-post the ReadFile — do NOT call CancelIo here.
+            // CancelIo breaks the pipe from the kernel's perspective, which
+            // causes the server's blocking ReadFile to return an error and
+            // log "GUI client disconnected" even though the GUI is still alive.
+            DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 10000);
             
             if (wait_result == WAIT_TIMEOUT) {
-                CancelIo(g_hPipe);
+                // No message yet — pipe is healthy, just re-post the read.
                 continue;
             }
             
