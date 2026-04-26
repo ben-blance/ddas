@@ -81,6 +81,7 @@ void remove_filepath_from_ipc_groups(const char *filepath) {
 
     EnterCriticalSection(&g_groups_lock);
 
+    DuplicateGroup *affected_group = NULL;
     for (int i = 0; i < g_group_count; i++) {
         DuplicateGroup *group = &g_duplicate_groups[i];
 
@@ -92,14 +93,23 @@ void remove_filepath_from_ipc_groups(const char *filepath) {
                 }
                 memset(&group->files[group->file_count - 1], 0, sizeof(FileInfo));
                 group->file_count--;
-                // Mark unsent so the GUI receives the corrected group on next update
                 group->sent_to_client = FALSE;
+                affected_group = group;
                 break; // A filepath appears at most once per group
             }
         }
+        if (affected_group) break;
     }
 
     LeaveCriticalSection(&g_groups_lock);
+    if (affected_group && g_pipe_server && g_pipe_server->client_connected) {
+        BOOL send_ok = send_duplicate_group(affected_group);
+        if (send_ok) {
+            EnterCriticalSection(&g_groups_lock);
+            affected_group->sent_to_client = TRUE;
+            LeaveCriticalSection(&g_groups_lock);
+        }
+    }
 }
 
 // Find existing group by hash or create new one
