@@ -102,6 +102,9 @@ BOOL send_alert_error(const char *error_message, const char *timestamp);
 // Send all stored alerts to newly connected client
 BOOL send_alert_history_to_client(void);
 
+// Remove a filepath from all duplicate groups (call when a file is renamed or deleted)
+void remove_filepath_from_ipc_groups(const char *filepath);
+
 // Helper: Get current ISO 8601 timestamp
 void get_iso8601_timestamp(char *buffer, size_t buffer_size);
 

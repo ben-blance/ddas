@@ -25,7 +25,7 @@ static DWORD WINAPI pipe_server_thread(LPVOID param);
 static BOOL send_message(const char *json_message);
 static void handle_client_commands(HANDLE pipe);
 static DuplicateGroup* find_or_create_group(const char *filehash);
-static void send_duplicate_group(DuplicateGroup *group);
+static BOOL send_duplicate_group(DuplicateGroup *group);
 
 // Get current timestamp in ISO 8601 format
 void get_iso8601_timestamp(char *buffer, size_t buffer_size) {
@@ -75,6 +75,33 @@ uint64_t generate_file_index(const char *filepath) {
     return index;
 }
 
+// Remove a filepath from any duplicate group that contains it (called on file rename/delete)
+void remove_filepath_from_ipc_groups(const char *filepath) {
+    if (!g_groups_initialized) return;
+
+    EnterCriticalSection(&g_groups_lock);
+
+    for (int i = 0; i < g_group_count; i++) {
+        DuplicateGroup *group = &g_duplicate_groups[i];
+
+        for (int j = 0; j < group->file_count; j++) {
+            if (strcmp(group->files[j].filepath, filepath) == 0) {
+                // Shift subsequent entries down to fill the gap
+                for (int k = j; k < group->file_count - 1; k++) {
+                    group->files[k] = group->files[k + 1];
+                }
+                memset(&group->files[group->file_count - 1], 0, sizeof(FileInfo));
+                group->file_count--;
+                // Mark unsent so the GUI receives the corrected group on next update
+                group->sent_to_client = FALSE;
+                break; // A filepath appears at most once per group
+            }
+        }
+    }
+
+    LeaveCriticalSection(&g_groups_lock);
+}
+
 // Find existing group by hash or create new one
 static DuplicateGroup* find_or_create_group(const char *filehash) {
     // Search for existing group
@@ -99,10 +126,10 @@ static DuplicateGroup* find_or_create_group(const char *filehash) {
     return NULL;
 }
 
-// Send a duplicate group to the GUI
-static void send_duplicate_group(DuplicateGroup *group) {
+// Send a duplicate group to the GUI; returns TRUE if the message was written to the pipe
+static BOOL send_duplicate_group(DuplicateGroup *group) {
     if (group->file_count < 2) {
-        return;  // Not a duplicate group anymore
+        return FALSE;  // Not a duplicate group anymore
     }
     
     char message[MAX_MESSAGE_SIZE];
@@ -158,7 +185,7 @@ static void send_duplicate_group(DuplicateGroup *group) {
         group->last_updated
     );
     
-    send_message(message);
+    return send_message(message);
 }
 
 // Initialize pipe server
@@ -257,13 +284,18 @@ BOOL send_alert_history_to_client(void) {
     for (int i = 0; i < g_group_count; i++) {
         DuplicateGroup *group = &g_duplicate_groups[i];
         
-        if (group->file_count >= 2 && !group->sent_to_client) {
+        // Always resend every valid group on reconnect — the GUI starts fresh
+        // each connection, so it needs the full current state regardless of
+        // whether we sent this group to a previous client session.
+        if (group->file_count >= 2) {
             LeaveCriticalSection(&g_groups_lock);
-            send_duplicate_group(group);
+            BOOL send_ok = send_duplicate_group(group);
             Sleep(50);
             EnterCriticalSection(&g_groups_lock);
             
-            group->sent_to_client = TRUE;
+            if (send_ok) {
+                group->sent_to_client = TRUE;
+            }
         }
     }
     
@@ -483,10 +515,15 @@ BOOL send_alert_duplicate_detected(
     
     // Send the complete updated group only if client is connected
     if (g_pipe_server && g_pipe_server->client_connected) {
-        send_duplicate_group(group);
+        BOOL send_ok = send_duplicate_group(group);
         
         EnterCriticalSection(&g_groups_lock);
-        group->sent_to_client = TRUE;
+        // Only mark as sent if the write actually reached the pipe buffer;
+        // if it failed (broken connection) leave sent_to_client=FALSE so the
+        // next reconnect's send_alert_history_to_client will resend it.
+        if (send_ok) {
+            group->sent_to_client = TRUE;
+        }
         LeaveCriticalSection(&g_groups_lock);
         
         if (was_sent) {

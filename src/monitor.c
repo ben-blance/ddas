@@ -4,6 +4,7 @@
 #include "hash_table.h"
 #include "file_ops.h"
 #include "empty_files.h"
+#include "ipc_pipe.h"
 #include "utils.h"
 #include <stdio.h>
 #include <wchar.h>
@@ -110,6 +111,34 @@ static void scan_new_directory(const char *dir_path) {
     FindClose(hFind);
 }
 
+static void scan_for_new_files_in_dir(const char *dir_path) {
+    WIN32_FIND_DATA find_data;
+    char search_path[MAX_PATH];
+    snprintf(search_path, MAX_PATH, "%s\\*", dir_path);
+
+    HANDLE hFind = FindFirstFile(search_path, &find_data);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (strcmp(find_data.cFileName, ".") == 0 ||
+            strcmp(find_data.cFileName, "..") == 0) continue;
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (should_ignore_file(find_data.cFileName)) continue;
+
+        char full_path[MAX_PATH];
+        snprintf(full_path, MAX_PATH, "%s\\%s", dir_path, find_data.cFileName);
+
+        // Only process files not already in the hash table — these are the
+        // rename targets that Windows never sent a RENAMED_NEW event for.
+        if (!filepath_in_hash_table(g_hash_table, full_path)) {
+            Sleep(50);
+            process_file(full_path, "RENAMED TO");
+        }
+    } while (FindNextFile(hFind, &find_data));
+
+    FindClose(hFind);
+}
+
 DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
     const char *dir_path = (const char*)lpParam;
     
@@ -148,7 +177,10 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
     safe_printf("\n=== File System Monitor Started ===\n");
     safe_printf("Watching for changes during scan and after...\n\n");
     
-    char buffer[4096];
+    // 65536 bytes — large enough to absorb bursts of events from indexers/AV
+    // without triggering ERROR_NOTIFY_ENUM_DIR (buffer-overflow) drops.
+    // Declared static so it lives in the data segment, not the stack.
+    static char buffer[65536];
     DWORD bytes_returned;
     OVERLAPPED overlapped = {0};
     overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -205,6 +237,12 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
                 if (error == ERROR_OPERATION_ABORTED) {
                     break; // Clean shutdown
                 }
+                if (error == ERROR_NOTIFY_ENUM_DIR) {
+                    // Buffer overflowed — Windows discarded all queued events.
+                    // This is the primary cause of missed rename events in deep
+                    // directory trees when indexers/AV generate concurrent events.
+                    safe_printf("[WARNING] Monitor buffer overflow (ERROR_NOTIFY_ENUM_DIR) - some file events were lost\n");
+                }
                 continue;
             }
             
@@ -225,8 +263,14 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
                 WideCharToMultiByte(CP_UTF8, 0, filename, -1, 
                                    filename_utf8, MAX_PATH, NULL, NULL);
                 snprintf(full_path, MAX_PATH, "%s\\%s", dir_path, filename_utf8);
-                
-                if (should_ignore_file(filename_utf8)) {
+
+                // Use only the filename component for the ignore check — consistent
+                // with scan_directory which calls should_ignore_file(cFileName).
+                // Using the full relative path causes false positives when a parent
+                // directory name matches an ignore pattern (e.g. ".tmp", "~", ".bak").
+                const char *fname_sep = strrchr(filename_utf8, '\\');
+                const char *filename_for_check = fname_sep ? fname_sep + 1 : filename_utf8;
+                if (should_ignore_file(filename_for_check)) {
                     if (fni->NextEntryOffset == 0) break;
                     fni = (FILE_NOTIFY_INFORMATION*)((char*)fni + fni->NextEntryOffset);
                     continue;
@@ -259,8 +303,23 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
                     
                     case FILE_ACTION_MODIFIED: {
                         DWORD attrs = GetFileAttributes(full_path);
-                        if (attrs != INVALID_FILE_ATTRIBUTES && 
-                            !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                        if (attrs == INVALID_FILE_ATTRIBUTES) {
+                            // File doesn't exist — Windows reported a nested
+                            // file rename's OLD name as FILE_ACTION_MODIFIED
+                            // instead of FILE_ACTION_RENAMED_OLD_NAME.
+                            // Treat it identically to a rename-old event.
+                            safe_printf("[RENAMED FROM] %s\n", full_path);
+                            remove_file_from_table(g_hash_table, full_path);
+                            remove_empty_file(full_path);
+                            remove_filepath_from_ipc_groups(full_path);
+                        } else if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                            // A directory's contents changed — a file inside it
+                            // was renamed but Windows won't send a RENAMED_NEW
+                            // event for the new filename in a subdirectory.
+                            // Scan the directory for files not yet tracked.
+                            Sleep(100);
+                            scan_for_new_files_in_dir(full_path);
+                        } else {
                             Sleep(100);
                             safe_printf("[MODIFIED] %s - Reprocessing...\n", full_path);
                             remove_file_from_table(g_hash_table, full_path);
@@ -278,6 +337,13 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
                             safe_printf("[DELETED] %s\n", full_path);
                             remove_file_from_table(g_hash_table, full_path);
                             remove_empty_file(full_path);
+                            // Also clean up IPC groups: Windows sometimes reports a
+                            // file rename inside a subdirectory as REMOVED+ADDED
+                            // rather than RENAMED_OLD+RENAMED_NEW.  Without this,
+                            // the old path would remain in the duplicate group and
+                            // cause CountRemainingFiles to return a false low count
+                            // on the GUI, making the group disappear after Refresh.
+                            remove_filepath_from_ipc_groups(full_path);
                         }
                         break;
                     }
@@ -286,6 +352,10 @@ DWORD WINAPI monitor_thread_func(LPVOID lpParam) {
                         safe_printf("[RENAMED FROM] %s\n", full_path);
                         remove_file_from_table(g_hash_table, full_path);
                         remove_empty_file(full_path);
+                        // Also purge the stale path from the IPC duplicate groups so
+                        // that (a) send_duplicate_group never uses it as the trigger
+                        // and (b) CountRemainingFiles on the GUI stays accurate.
+                        remove_filepath_from_ipc_groups(full_path);
                         break;
                         
                     case FILE_ACTION_RENAMED_NEW_NAME: {

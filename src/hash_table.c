@@ -327,6 +327,23 @@ void find_duplicates(HashTable *table) {
     send_alert_scan_complete(total_duplicate_files, duplicate_groups, timestamp);
 }
 
+BOOL filepath_in_hash_table(HashTable *table, const char *filepath) {
+    EnterCriticalSection(&table->lock);
+    BOOL found = FALSE;
+    for (size_t i = 0; i < table->size && !found; i++) {
+        FileHash *current = table->buckets[i];
+        while (current) {
+            if (strcmp(current->filepath, filepath) == 0) {
+                found = TRUE;
+                break;
+            }
+            current = current->next;
+        }
+    }
+    LeaveCriticalSection(&table->lock);
+    return found;
+}
+
 void free_hash_table(HashTable *table) {
     for (size_t i = 0; i < table->size; i++) {
         FileHash *current = table->buckets[i];

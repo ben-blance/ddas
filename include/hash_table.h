@@ -40,6 +40,9 @@ void print_duplicates_for_file(HashTable *table, const char *hash, const char *n
 // Find and report all duplicates
 void find_duplicates(HashTable *table);
 
+// Check if a filepath is already tracked in the table
+BOOL filepath_in_hash_table(HashTable *table, const char *filepath);
+
 // Free hash table
 void free_hash_table(HashTable *table);
 
