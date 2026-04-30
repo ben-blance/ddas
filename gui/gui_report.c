@@ -1,6 +1,13 @@
 // gui_report.c - Report window: creation, painting, list update, user actions
 #include "gui_common.h"
 
+// Index of the item last right-clicked (for context-menu handler)
+static int  s_ctxItemIdx    = -1;
+// TRUE once user enters selection mode via right-click > Select
+static BOOL s_selectionMode = FALSE;
+// Per-row check state (managed manually, no LVS_EX_CHECKBOXES needed)
+static BOOL s_checked[MAX_DUPLICATES + 1];
+
 // ----------------------------------------------------------------
 // UpdateReportWindow — repopulate the file list for the current group
 // ----------------------------------------------------------------
@@ -10,6 +17,10 @@ void UpdateReportWindow(void) {
 
     HWND hList = GetDlgItem(g_hReportWnd, 2001);
     ListView_DeleteAllItems(hList);
+
+    // Reset selection state whenever the list is rebuilt
+    s_selectionMode = FALSE;
+    memset(s_checked, 0, sizeof(s_checked));
 
     EnterCriticalSection(&g_alert_lock);
 
@@ -110,7 +121,7 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         SendMessage(hSection, WM_SETFONT, (WPARAM)g_fontUIBold, TRUE);
 
         HWND hList = CreateWindowEx(0, WC_LISTVIEW, "",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_OWNERDRAWFIXED,
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_OWNERDRAWFIXED,
             24, 112, 832, 388, hwnd, (HMENU)2001, GetModuleHandle(NULL), NULL);
         ListView_SetExtendedListViewStyle(hList,
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -203,6 +214,38 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 DeleteObject(ab);
             }
 
+            // Draw checkbox only when in selection mode
+            if (s_selectionMode) {
+                int rh   = row.bottom - row.top;
+                int cbSz = 14;
+                int cbY  = row.top + (rh - cbSz) / 2;
+                RECT cb  = { row.left + 5, cbY,
+                             row.left + 5 + cbSz, cbY + cbSz };
+                BOOL chk = s_checked[dis->itemID];
+
+                HBRUSH cbFill = CreateSolidBrush(chk ? CLR_ACCENT : CLR_PANEL);
+                HPEN   cbPen  = CreatePen(PS_SOLID, 1,
+                    chk ? CLR_ACCENT : CLR_BORDER);
+                HGDIOBJ ocbB = SelectObject(dc, cbFill);
+                HGDIOBJ ocbP = SelectObject(dc, cbPen);
+                RoundRect(dc, cb.left, cb.top, cb.right, cb.bottom, 4, 4);
+                SelectObject(dc, ocbB);
+                SelectObject(dc, ocbP);
+                DeleteObject(cbFill);
+                DeleteObject(cbPen);
+
+                if (chk) {
+                    // Tick mark
+                    HPEN tick = CreatePen(PS_SOLID, 2, RGB(10, 14, 18));
+                    HGDIOBJ ot = SelectObject(dc, tick);
+                    MoveToEx(dc, cb.left + 3,  cb.top + 7,  NULL);
+                    LineTo  (dc, cb.left + 6,  cb.top + 10);
+                    LineTo  (dc, cb.left + 11, cb.top + 3);
+                    SelectObject(dc, ot);
+                    DeleteObject(tick);
+                }
+            }
+
             int cols = Header_GetItemCount(ListView_GetHeader(hList));
             SetBkMode(dc, TRANSPARENT);
             HGDIOBJ oldFont = SelectObject(dc, g_fontUI);
@@ -215,7 +258,7 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     Header_GetItemRect(ListView_GetHeader(hList), 0, &hr);
                     cr.right = cr.left + (hr.right - hr.left);
                 }
-                cr.left += 10; cr.right -= 6;
+                cr.left += (c == 0 && s_selectionMode) ? 26 : 10; cr.right -= 6;
 
                 char text[1024] = {0};
                 LVITEM lvi = {0};
@@ -289,6 +332,52 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 }
             }
         }
+
+        // Click inside the checkbox column (leftmost 26px) toggles check
+        if (nm->idFrom == 2001 && nm->code == NM_CLICK) {
+            if (s_selectionMode) {
+                LPNMITEMACTIVATE nmia = (LPNMITEMACTIVATE)lParam;
+                if (nmia->iItem >= 0 && nmia->ptAction.x < 26) {
+                    s_checked[nmia->iItem] = !s_checked[nmia->iItem];
+                    // Exit selection mode if nothing is checked any more
+                    HWND hList = GetDlgItem(hwnd, 2001);
+                    BOOL any   = FALSE;
+                    int  n     = ListView_GetItemCount(hList);
+                    for (int i = 0; i < n; i++)
+                        if (s_checked[i]) { any = TRUE; break; }
+                    if (!any) s_selectionMode = FALSE;
+                    InvalidateRect(hList, NULL, FALSE);
+                }
+            }
+        }
+        break;
+    }
+
+    // ------------------------------------------------------------
+    case WM_CONTEXTMENU: {
+        HWND hList = GetDlgItem(hwnd, 2001);
+        if ((HWND)wParam != hList) break;
+
+        // Convert screen coords to ListView client coords for hit-test
+        POINT pt   = { (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam) };
+        POINT ptCl = pt;
+        ScreenToClient(hList, &ptCl);
+
+        LVHITTESTINFO ht = {0};
+        ht.pt = ptCl;
+        int item = ListView_HitTest(hList, &ht);
+        if (item < 0) break;
+
+        s_ctxItemIdx = item;
+        BOOL chk = s_selectionMode && s_checked[item];
+
+        HMENU hCtx = CreatePopupMenu();
+        AppendMenu(hCtx, MF_STRING, IDM_CTX_SELECT,
+            chk ? "Deselect" : "Select");
+        SetForegroundWindow(hwnd);
+        TrackPopupMenu(hCtx, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+            pt.x, pt.y, 0, hwnd, NULL);
+        DestroyMenu(hCtx);
         break;
     }
 
@@ -297,6 +386,15 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         int id = LOWORD(wParam);
 
         switch (id) {
+        case IDM_CTX_SELECT: {  // Enter/toggle selection mode
+            if (s_ctxItemIdx < 0) break;
+            HWND hList = GetDlgItem(hwnd, 2001);
+            s_selectionMode = TRUE;
+            s_checked[s_ctxItemIdx] = !s_checked[s_ctxItemIdx];
+            s_ctxItemIdx = -1;
+            InvalidateRect(hList, NULL, FALSE);
+            break;
+        }
         case 2008: {  // Previous group
             EnterCriticalSection(&g_alert_lock);
             g_current_alert_index = FindNextValidGroup(g_current_alert_index, -1);
@@ -338,72 +436,114 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             break;
         }
 
-        case 2003: {  // Delete selected
+        case 2003: {  // Delete checked files (multi-select)
             HWND hList = GetDlgItem(hwnd, 2001);
-            int  sel   = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
-            if (sel == -1) {
-                MessageBox(hwnd, "Please select a file first.", "Info", MB_OK | MB_ICONINFORMATION);
+            int  itemCount = ListView_GetItemCount(hList);
+
+            // Collect all checked file paths
+            char checkedPaths[MAX_DUPLICATES + 1][MAX_PATH];
+            int  checkedCount = 0;
+            for (int i = 0; i < itemCount && checkedCount <= MAX_DUPLICATES; i++) {
+                if (s_checked[i]) {
+                    ListView_GetItemText(hList, i, 0,
+                        checkedPaths[checkedCount], MAX_PATH);
+                    checkedCount++;
+                }
+            }
+
+            if (checkedCount == 0) {
+                MessageBox(hwnd,
+                    "No files selected for deletion.\n\n"
+                    "Right-click a file and choose 'Select' to enter\n"
+                    "selection mode, then click checkboxes to mark files.",
+                    "Nothing Selected", MB_OK | MB_ICONINFORMATION);
                 break;
             }
 
-            char fp[MAX_PATH];
-            ListView_GetItemText(hList, sel, 0, fp, MAX_PATH);
-
-            if (!FileExists(fp)) {
-                MessageBox(hwnd, "File has already been deleted.", "Info", MB_OK | MB_ICONINFORMATION);
-                UpdateReportWindow();
-                break;
-            }
-
+            // Is this a whole-group deletion?
             EnterCriticalSection(&g_alert_lock);
-            BOOL is_trigger = (strcmp(fp, g_alerts[g_current_alert_index].trigger_file.filepath) == 0);
+            int totalRemaining = CountRemainingFiles(
+                &g_alerts[g_current_alert_index]);
+            char triggerCopy[MAX_PATH];
+            strncpy(triggerCopy,
+                g_alerts[g_current_alert_index].trigger_file.filepath,
+                MAX_PATH - 1);
+            triggerCopy[MAX_PATH - 1] = '\0';
             LeaveCriticalSection(&g_alert_lock);
 
-            char confirm[MAX_PATH + 200];
-            if (is_trigger)
-                snprintf(confirm, sizeof(confirm),
-                    "Delete this TRIGGER file?\n\n%s\n\n"
-                    "This will move it to Recycle Bin.\n"
-                    "The next duplicate will become the new trigger.", fp);
-            else
-                snprintf(confirm, sizeof(confirm),
-                    "Delete this file?\n\n%s\n\nThis will move it to Recycle Bin.", fp);
+            BOOL fullGroup = (checkedCount >= totalRemaining);
 
-            if (MessageBox(hwnd, confirm, "Confirm Delete", MB_YESNO | MB_ICONWARNING) != IDYES)
+            char confirm[600];
+            if (fullGroup) {
+                snprintf(confirm, sizeof(confirm),
+                    "Delete entire group?\n\n"
+                    "All %d files with identical content will be moved to\n"
+                    "the Recycle Bin and this duplicate group will be removed.",
+                    checkedCount);
+            } else {
+                snprintf(confirm, sizeof(confirm),
+                    "Delete %d selected file(s)?\n\n"
+                    "They will be moved to the Recycle Bin.",
+                    checkedCount);
+            }
+
+            if (MessageBox(hwnd, confirm, "Confirm Delete",
+                    MB_YESNO | MB_ICONWARNING) != IDYES)
                 break;
 
-            char from[MAX_PATH + 2];
-            memset(from, 0, sizeof(from));
-            strncpy(from, fp, MAX_PATH);
+            // Delete each checked file
+            int  failCount      = 0;
+            BOOL triggerDeleted = FALSE;
 
-            SHFILEOPSTRUCT fo = {0};
-            fo.hwnd   = hwnd;
-            fo.wFunc  = FO_DELETE;
-            fo.pFrom  = from;
-            fo.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+            for (int i = 0; i < checkedCount; i++) {
+                if (!FileExists(checkedPaths[i])) continue;
+                if (strcmp(checkedPaths[i], triggerCopy) == 0)
+                    triggerDeleted = TRUE;
 
-            int result  = SHFileOperation(&fo);
-            BOOL deleted = (result == 0 && !fo.fAnyOperationsAborted);
-            if (!deleted) { Sleep(100); deleted = !FileExists(fp); }
+                char from[MAX_PATH + 2];
+                memset(from, 0, sizeof(from));
+                strncpy(from, checkedPaths[i], MAX_PATH);
 
-            if (deleted) {
-                EnterCriticalSection(&g_alert_lock);
-                int cur = g_current_alert_index;
-                if (is_trigger) PromoteDuplicate(&g_alerts[cur]);
+                SHFILEOPSTRUCT fo = {0};
+                fo.hwnd   = hwnd;
+                fo.wFunc  = FO_DELETE;
+                fo.pFrom  = from;
+                fo.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+
+                int res  = SHFileOperation(&fo);
+                BOOL ok  = (res == 0 && !fo.fAnyOperationsAborted);
+                if (!ok) { Sleep(100); ok = !FileExists(checkedPaths[i]); }
+                if (!ok) failCount++;
+            }
+
+            // Update group state
+            EnterCriticalSection(&g_alert_lock);
+            int cur = g_current_alert_index;
+            if (fullGroup) {
+                RemoveAlertAt(cur);
+            } else {
+                if (triggerDeleted) PromoteDuplicate(&g_alerts[cur]);
                 int remaining = CountRemainingFiles(&g_alerts[cur]);
                 if (remaining <= 1) RemoveAlertAt(cur);
                 else                g_alerts[cur].files_remaining = remaining;
-                LeaveCriticalSection(&g_alert_lock);
-
-                MessageBox(hwnd, "File moved to Recycle Bin.", "Success", MB_OK | MB_ICONINFORMATION);
-                UpdateReportWindow();
-            } else {
-                char err[256];
-                snprintf(err, sizeof(err),
-                    "Failed to delete file.\nError code: %d\n\nThe file may be locked or in use.",
-                    result);
-                MessageBox(hwnd, err, "Error", MB_OK | MB_ICONERROR);
             }
+            LeaveCriticalSection(&g_alert_lock);
+
+            // Result notification
+            if (failCount > 0) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                    "%d file(s) moved to Recycle Bin.\n"
+                    "%d file(s) could not be deleted (may be in use).",
+                    checkedCount - failCount, failCount);
+                MessageBox(hwnd, msg, "Partial Delete", MB_OK | MB_ICONWARNING);
+            } else {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                    "%d file(s) moved to Recycle Bin.", checkedCount);
+                MessageBox(hwnd, msg, "Success", MB_OK | MB_ICONINFORMATION);
+            }
+            UpdateReportWindow();
             break;
         }
 

@@ -22,6 +22,9 @@
 #define ID_TRAY_SHOW_WINDOW 1002
 #define ID_TRAY_ABOUT       1003
 
+// Context menu IDs
+#define IDM_CTX_SELECT      3001
+
 // IPC
 #define PIPE_NAME "\\\\.\\pipe\\ddas_ipc"
 
