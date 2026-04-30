@@ -29,11 +29,15 @@ ENGINE_SRCS = $(ENGINE_MAIN_SRCS) $(BLAKE_SRCS)
 ENGINE_OBJS = $(ENGINE_SRCS:.c=.o)
 
 # GUI source files
-GUI_SRCS = $(GUI_DIR)/gui_tray.c
+GUI_SRCS = $(GUI_DIR)/gui_tray.c \
+           $(GUI_DIR)/gui_alerts.c \
+           $(GUI_DIR)/gui_pipe.c \
+           $(GUI_DIR)/gui_theme.c \
+           $(GUI_DIR)/gui_report.c
 GUI_OBJS = $(GUI_SRCS:.c=.o)
 
 # GUI libraries
-GUI_LIBS = -mwindows -lshell32 -lcomctl32 -luser32 -lgdi32
+GUI_LIBS = -mwindows -lshell32 -lcomctl32 -luser32 -lgdi32 -luxtheme
 
 .PHONY: all clean engine gui run-engine run-gui run-both test help structure install stop
 
