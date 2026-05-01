@@ -2,6 +2,7 @@
 #include "file_ops.h"
 #include "hash_table.h"
 #include "empty_files.h"
+#include "ipc_pipe.h"
 #include "utils.h"
 #include "blake3.h"
 #include <stdio.h>
@@ -111,6 +112,12 @@ void process_file(const char *full_path, const char *action) {
     if (empty_check == 1) {
         safe_printf("[%s] %s (0 bytes - skipped)\n", action, full_path);
         add_empty_file(full_path);
+
+        char last_mod[32]  = {0};
+        char timestamp[32] = {0};
+        get_file_modified_time(full_path, last_mod, sizeof(last_mod));
+        get_iso8601_timestamp(timestamp, sizeof(timestamp));
+        send_alert_empty_file(full_path, 0, last_mod, timestamp);
         return;
     } else if (empty_check == -1) {
         safe_printf("[ERROR] Cannot access: %s\n", full_path);

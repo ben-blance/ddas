@@ -9,6 +9,10 @@ int              g_alert_count        = 0;
 int              g_current_alert_index = 0;
 CRITICAL_SECTION g_alert_lock;
 
+EmptyFileEntry   g_empty_entries[MAX_EMPTY_FILES];
+int              g_empty_count = 0;
+int              g_view_mode   = VIEW_MODE_DUPLICATES;
+
 // ----------------------------------------------------------------
 // File utilities
 // ----------------------------------------------------------------
@@ -286,4 +290,79 @@ void RemoveAlertAt(int index) {
         g_current_alert_index = 0;
     else if (g_current_alert_index >= g_alert_count)
         g_current_alert_index = g_alert_count - 1;
+}
+
+// ----------------------------------------------------------------
+// Empty file list operations
+// ----------------------------------------------------------------
+
+void RemoveEmptyEntry(const char *filepath) {
+    EnterCriticalSection(&g_alert_lock);
+    for (int i = 0; i < g_empty_count; i++) {
+        if (strcmp(g_empty_entries[i].filepath, filepath) == 0) {
+            for (int j = i; j < g_empty_count - 1; j++)
+                g_empty_entries[j] = g_empty_entries[j + 1];
+            memset(&g_empty_entries[g_empty_count - 1], 0, sizeof(EmptyFileEntry));
+            g_empty_count--;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_alert_lock);
+}
+
+static void extract_json_string(const char *json, const char *key,
+                                char *out, size_t outsz) {
+    out[0] = '\0';
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *s = strstr(json, pat);
+    if (!s) return;
+    s += strlen(pat);
+    const char *e = strchr(s, '"');
+    if (!e) return;
+    size_t len = (size_t)(e - s);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, s, len);
+    out[len] = '\0';
+}
+
+void ParseEmptyFileJSON(const char *json) {
+    char filepath[MAX_PATH] = {0};
+    extract_json_string(json, "filepath", filepath, sizeof(filepath));
+    if (filepath[0] == '\0') return;
+
+    char last_mod[32] = {0};
+    extract_json_string(json, "last_mod", last_mod, sizeof(last_mod));
+
+    unsigned long long filesize = 0;
+    const char *fs = strstr(json, "\"filesize\":");
+    if (fs) sscanf(fs + 11, "%llu", &filesize);
+
+    EnterCriticalSection(&g_alert_lock);
+
+    // De-dup
+    for (int i = 0; i < g_empty_count; i++) {
+        if (strcmp(g_empty_entries[i].filepath, filepath) == 0) {
+            g_empty_entries[i].filesize = filesize;
+            strncpy(g_empty_entries[i].last_modified, last_mod, 31);
+            g_empty_entries[i].last_modified[31] = '\0';
+            LeaveCriticalSection(&g_alert_lock);
+            return;
+        }
+    }
+
+    if (g_empty_count >= MAX_EMPTY_FILES) {
+        // drop oldest
+        for (int i = 0; i < MAX_EMPTY_FILES - 1; i++)
+            g_empty_entries[i] = g_empty_entries[i + 1];
+        g_empty_count = MAX_EMPTY_FILES - 1;
+    }
+
+    EmptyFileEntry *e = &g_empty_entries[g_empty_count++];
+    memset(e, 0, sizeof(*e));
+    strncpy(e->filepath, filepath, MAX_PATH - 1);
+    e->filesize = filesize;
+    strncpy(e->last_modified, last_mod, 31);
+
+    LeaveCriticalSection(&g_alert_lock);
 }

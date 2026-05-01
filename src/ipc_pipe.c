@@ -20,6 +20,18 @@ static int g_group_count = 0;
 static CRITICAL_SECTION g_groups_lock;
 static BOOL g_groups_initialized = FALSE;
 
+// Empty-file tracking for IPC resend on reconnect
+typedef struct {
+    char filepath[MAX_PATH];
+    uint64_t filesize;
+    char last_modified[32];
+    char timestamp[32];
+} EmptyFileRecord;
+
+#define MAX_EMPTY_FILE_RECORDS 1000
+static EmptyFileRecord g_empty_records[MAX_EMPTY_FILE_RECORDS];
+static int g_empty_record_count = 0;
+
 // Forward declarations
 static DWORD WINAPI pipe_server_thread(LPVOID param);
 static BOOL send_message(const char *json_message);
@@ -276,6 +288,7 @@ void shutdown_pipe_server(void) {
         DeleteCriticalSection(&g_groups_lock);
         g_groups_initialized = FALSE;
         g_group_count = 0;
+        g_empty_record_count = 0;
     }
     
     safe_printf("[IPC] Pipe server shut down\n");
@@ -312,6 +325,33 @@ BOOL send_alert_history_to_client(void) {
     LeaveCriticalSection(&g_groups_lock);
     
     safe_printf("[IPC] Finished sending duplicate groups\n");
+
+    // Resend known empty files
+    EnterCriticalSection(&g_groups_lock);
+    int empty_count = g_empty_record_count;
+    EmptyFileRecord snapshot[MAX_EMPTY_FILE_RECORDS];
+    if (empty_count > 0) {
+        memcpy(snapshot, g_empty_records, sizeof(EmptyFileRecord) * empty_count);
+    }
+    LeaveCriticalSection(&g_groups_lock);
+
+    if (empty_count > 0) {
+        safe_printf("[IPC] Sending %d empty files to client...\n", empty_count);
+        for (int i = 0; i < empty_count; i++) {
+            char message[MAX_PATH + 512];
+            snprintf(message, sizeof(message),
+                "{\"type\":\"ALERT\",\"event\":\"EMPTY_FILE\","
+                "\"filepath\":\"%s\",\"filesize\":%llu,"
+                "\"last_mod\":\"%s\",\"timestamp\":\"%s\"}\n",
+                snapshot[i].filepath,
+                (unsigned long long)snapshot[i].filesize,
+                snapshot[i].last_modified,
+                snapshot[i].timestamp);
+            send_message(message);
+            Sleep(20);
+        }
+    }
+
     return TRUE;
 }
 
@@ -605,5 +645,54 @@ BOOL send_alert_error(const char *error_message, const char *timestamp) {
         error_message, timestamp
     );
     
+    return send_message(message);
+}
+
+// Send empty file detected alert (also tracked for resend on reconnect)
+BOOL send_alert_empty_file(const char *filepath, uint64_t filesize,
+                           const char *last_modified, const char *timestamp) {
+    if (!g_groups_initialized) {
+        InitializeCriticalSection(&g_groups_lock);
+        g_groups_initialized = TRUE;
+    }
+
+    EnterCriticalSection(&g_groups_lock);
+
+    // De-dup: skip if already tracked
+    BOOL exists = FALSE;
+    for (int i = 0; i < g_empty_record_count; i++) {
+        if (strcmp(g_empty_records[i].filepath, filepath) == 0) {
+            exists = TRUE;
+            break;
+        }
+    }
+
+    if (!exists && g_empty_record_count < MAX_EMPTY_FILE_RECORDS) {
+        EmptyFileRecord *r = &g_empty_records[g_empty_record_count++];
+        strncpy(r->filepath, filepath, MAX_PATH - 1);
+        r->filepath[MAX_PATH - 1] = '\0';
+        r->filesize = filesize;
+        strncpy(r->last_modified, last_modified ? last_modified : "", 31);
+        r->last_modified[31] = '\0';
+        strncpy(r->timestamp, timestamp ? timestamp : "", 31);
+        r->timestamp[31] = '\0';
+    }
+
+    LeaveCriticalSection(&g_groups_lock);
+
+    if (!g_pipe_server || !g_pipe_server->client_connected) {
+        return FALSE;
+    }
+
+    char message[MAX_PATH + 512];
+    snprintf(message, sizeof(message),
+        "{\"type\":\"ALERT\",\"event\":\"EMPTY_FILE\","
+        "\"filepath\":\"%s\",\"filesize\":%llu,"
+        "\"last_mod\":\"%s\",\"timestamp\":\"%s\"}\n",
+        filepath, (unsigned long long)filesize,
+        last_modified ? last_modified : "",
+        timestamp ? timestamp : ""
+    );
+
     return send_message(message);
 }

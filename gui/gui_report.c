@@ -6,7 +6,28 @@ static int  s_ctxItemIdx    = -1;
 // TRUE once user enters selection mode via right-click > Select
 static BOOL s_selectionMode = FALSE;
 // Per-row check state (managed manually, no LVS_EX_CHECKBOXES needed)
-static BOOL s_checked[MAX_DUPLICATES + 1];
+static BOOL s_checked[MAX_EMPTY_FILES + 1];
+// Track last applied column layout so we only reconfigure on view change
+static int  s_lastConfiguredView = -1;
+
+// Combobox view-selector control id
+#define ID_VIEW_COMBO 2020
+
+static void ConfigureColumnsForView(HWND hList, int mode) {
+    while (ListView_DeleteColumn(hList, 0)) {}
+    LVCOLUMN lvc = {0};
+    lvc.mask = LVCF_TEXT | LVCF_WIDTH;
+    if (mode == VIEW_MODE_DUPLICATES) {
+        lvc.pszText = "File Path"; lvc.cx = 470; ListView_InsertColumn(hList, 0, &lvc);
+        lvc.pszText = "Size";      lvc.cx = 110; ListView_InsertColumn(hList, 1, &lvc);
+        lvc.pszText = "Type";      lvc.cx = 100; ListView_InsertColumn(hList, 2, &lvc);
+        lvc.pszText = "Modified";  lvc.cx = 145; ListView_InsertColumn(hList, 3, &lvc);
+    } else {
+        lvc.pszText = "File Path"; lvc.cx = 570; ListView_InsertColumn(hList, 0, &lvc);
+        lvc.pszText = "Size";      lvc.cx = 110; ListView_InsertColumn(hList, 1, &lvc);
+        lvc.pszText = "Modified";  lvc.cx = 145; ListView_InsertColumn(hList, 2, &lvc);
+    }
+}
 
 // ----------------------------------------------------------------
 // UpdateReportWindow — repopulate the file list for the current group
@@ -16,14 +37,69 @@ void UpdateReportWindow(void) {
     if (!g_hReportWnd) return;
 
     HWND hList = GetDlgItem(g_hReportWnd, 2001);
+    HWND hPrev = GetDlgItem(g_hReportWnd, 2008);
+    HWND hNext = GetDlgItem(g_hReportWnd, 2009);
+
+    // Reconfigure columns when switching views
+    if (s_lastConfiguredView != g_view_mode) {
+        ConfigureColumnsForView(hList, g_view_mode);
+        s_lastConfiguredView = g_view_mode;
+    }
+
     ListView_DeleteAllItems(hList);
 
     // Reset selection state whenever the list is rebuilt
     s_selectionMode = FALSE;
     memset(s_checked, 0, sizeof(s_checked));
 
+    // Show/hide group navigation buttons based on view
+    ShowWindow(hPrev, g_view_mode == VIEW_MODE_DUPLICATES ? SW_SHOW : SW_HIDE);
+    ShowWindow(hNext, g_view_mode == VIEW_MODE_DUPLICATES ? SW_SHOW : SW_HIDE);
+
+    // Update header labels
+    SetDlgItemText(g_hReportWnd, 2010,
+        g_view_mode == VIEW_MODE_DUPLICATES ? "Duplicate Groups" : "Empty Files");
+    SetDlgItemText(g_hReportWnd, 2011,
+        g_view_mode == VIEW_MODE_DUPLICATES ? "FILES IN GROUP" : "EMPTY FILES (0 BYTES)");
+
     EnterCriticalSection(&g_alert_lock);
 
+    if (g_view_mode == VIEW_MODE_EMPTY) {
+        char nav[128];
+        snprintf(nav, sizeof(nav),
+            "%d empty file(s) detected.", g_empty_count);
+        SetDlgItemText(g_hReportWnd, 2007, nav);
+        SetDlgItemText(g_hReportWnd, 2005, "");
+
+        int vi = 0;
+        for (int i = 0; i < g_empty_count; i++) {
+            if (!FileExists(g_empty_entries[i].filepath)) continue;
+
+            LVITEM lvi = {0};
+            lvi.mask     = LVIF_TEXT;
+            lvi.iItem    = vi;
+            lvi.iSubItem = 0;
+            lvi.pszText  = g_empty_entries[i].filepath;
+            ListView_InsertItem(hList, &lvi);
+
+            char sz[64];
+            format_file_size(g_empty_entries[i].filesize, sz, sizeof(sz));
+            ListView_SetItemText(hList, vi, 1, sz);
+            ListView_SetItemText(hList, vi, 2,
+                strlen(g_empty_entries[i].last_modified) > 0
+                    ? g_empty_entries[i].last_modified : "Unknown");
+            vi++;
+        }
+
+        if (vi == 0) {
+            SetDlgItemText(g_hReportWnd, 2007,
+                "No empty files detected yet - DDAS is watching for empty files.");
+        }
+        LeaveCriticalSection(&g_alert_lock);
+        return;
+    }
+
+    // Duplicates view
     if (g_alert_count == 0) {
         SetDlgItemText(g_hReportWnd, 2007,
             "No duplicate alerts yet - DDAS is watching for duplicates.");
@@ -99,10 +175,26 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         EnsureThemeResources();
         ApplyDarkTitleBar(hwnd);
 
+        // Default to duplicates view on (re)creation so columns and labels
+        // initialize consistently regardless of previous session state.
+        g_view_mode = VIEW_MODE_DUPLICATES;
+        s_lastConfiguredView = -1;
+
         HWND hTitle = CreateWindow("STATIC", "Duplicate Groups",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             24, 18, 500, 32, hwnd, (HMENU)2010, GetModuleHandle(NULL), NULL);
         SendMessage(hTitle, WM_SETFONT, (WPARAM)g_fontTitle, TRUE);
+
+        // View selector dropdown — top right
+        HWND hCombo = CreateWindowEx(0, "COMBOBOX", "",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+            CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+            680, 22, 196, 200, hwnd, (HMENU)ID_VIEW_COMBO,
+            GetModuleHandle(NULL), NULL);
+        SendMessage(hCombo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)"Duplicate Files");
+        SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)"Empty Files");
+        SendMessage(hCombo, CB_SETCURSEL, 0, 0);
 
         HWND hSub = CreateWindow("STATIC", "",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -135,12 +227,9 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         SetWindowTheme(hHdr, L"", L"");
         SendMessage(hHdr, WM_SETFONT, (WPARAM)g_fontUIBold, TRUE);
 
-        LVCOLUMN lvc = {0};
-        lvc.mask = LVCF_TEXT | LVCF_WIDTH;
-        lvc.pszText = "File Path"; lvc.cx = 470; ListView_InsertColumn(hList, 0, &lvc);
-        lvc.pszText = "Size";      lvc.cx = 110; ListView_InsertColumn(hList, 1, &lvc);
-        lvc.pszText = "Type";      lvc.cx = 100; ListView_InsertColumn(hList, 2, &lvc);
-        lvc.pszText = "Modified";  lvc.cx = 145; ListView_InsertColumn(hList, 3, &lvc);
+        // Initial column layout (duplicates view)
+        ConfigureColumnsForView(hList, VIEW_MODE_DUPLICATES);
+        s_lastConfiguredView = VIEW_MODE_DUPLICATES;
 
         int by = 520;
         CreateModernButton(hwnd, "< Previous",     24,  by, 130, 38, 2008, BK_GHOST);
@@ -383,7 +472,19 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
     // ------------------------------------------------------------
     case WM_COMMAND: {
-        int id = LOWORD(wParam);
+        int id   = LOWORD(wParam);
+        int code = HIWORD(wParam);
+
+        if (id == ID_VIEW_COMBO && code == CBN_SELCHANGE) {
+            int sel = (int)SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+            int newMode = (sel == 1) ? VIEW_MODE_EMPTY : VIEW_MODE_DUPLICATES;
+            if (newMode != g_view_mode) {
+                g_view_mode = newMode;
+                UpdateReportWindow();
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            break;
+        }
 
         switch (id) {
         case IDM_CTX_SELECT: {  // Enter/toggle selection mode
@@ -440,10 +541,15 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             HWND hList = GetDlgItem(hwnd, 2001);
             int  itemCount = ListView_GetItemCount(hList);
 
-            // Collect all checked file paths
-            char checkedPaths[MAX_DUPLICATES + 1][MAX_PATH];
+            // Collect all checked file paths (heap-allocated to avoid large stack)
+            typedef char PathStr[MAX_PATH];
+            PathStr *checkedPaths = (PathStr*)malloc(sizeof(PathStr) * (MAX_EMPTY_FILES + 1));
+            if (!checkedPaths) {
+                MessageBox(hwnd, "Out of memory.", "Error", MB_OK | MB_ICONERROR);
+                break;
+            }
             int  checkedCount = 0;
-            for (int i = 0; i < itemCount && checkedCount <= MAX_DUPLICATES; i++) {
+            for (int i = 0; i < itemCount && checkedCount <= MAX_EMPTY_FILES; i++) {
                 if (s_checked[i]) {
                     ListView_GetItemText(hList, i, 0,
                         checkedPaths[checkedCount], MAX_PATH);
@@ -452,6 +558,7 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             }
 
             if (checkedCount == 0) {
+                free(checkedPaths);
                 MessageBox(hwnd,
                     "No files selected for deletion.\n\n"
                     "Right-click a file and choose 'Select' to enter\n"
@@ -460,6 +567,64 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 break;
             }
 
+            // ---------- Empty Files view ----------
+            if (g_view_mode == VIEW_MODE_EMPTY) {
+                char confirm[256];
+                snprintf(confirm, sizeof(confirm),
+                    "Delete %d empty file(s)?\n\n"
+                    "They will be moved to the Recycle Bin.",
+                    checkedCount);
+                if (MessageBox(hwnd, confirm, "Confirm Delete",
+                        MB_YESNO | MB_ICONWARNING) != IDYES) {
+                    free(checkedPaths);
+                    break;
+                }
+
+                int failCount = 0;
+                for (int i = 0; i < checkedCount; i++) {
+                    if (!FileExists(checkedPaths[i])) {
+                        RemoveEmptyEntry(checkedPaths[i]);
+                        continue;
+                    }
+
+                    char from[MAX_PATH + 2];
+                    memset(from, 0, sizeof(from));
+                    strncpy(from, checkedPaths[i], MAX_PATH);
+
+                    SHFILEOPSTRUCT fo = {0};
+                    fo.hwnd   = hwnd;
+                    fo.wFunc  = FO_DELETE;
+                    fo.pFrom  = from;
+                    fo.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+
+                    int res  = SHFileOperation(&fo);
+                    BOOL ok  = (res == 0 && !fo.fAnyOperationsAborted);
+                    if (!ok) { Sleep(100); ok = !FileExists(checkedPaths[i]); }
+                    if (ok) RemoveEmptyEntry(checkedPaths[i]);
+                    else    failCount++;
+                }
+
+                if (failCount > 0) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                        "%d file(s) moved to Recycle Bin.\n"
+                        "%d file(s) could not be deleted (may be in use).",
+                        checkedCount - failCount, failCount);
+                    MessageBox(hwnd, msg, "Partial Delete",
+                        MB_OK | MB_ICONWARNING);
+                } else {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                        "%d file(s) moved to Recycle Bin.", checkedCount);
+                    MessageBox(hwnd, msg, "Success",
+                        MB_OK | MB_ICONINFORMATION);
+                }
+                free(checkedPaths);
+                UpdateReportWindow();
+                break;
+            }
+
+            // ---------- Duplicates view ----------
             // Is this a whole-group deletion?
             EnterCriticalSection(&g_alert_lock);
             int totalRemaining = CountRemainingFiles(
@@ -488,8 +653,10 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             }
 
             if (MessageBox(hwnd, confirm, "Confirm Delete",
-                    MB_YESNO | MB_ICONWARNING) != IDYES)
+                    MB_YESNO | MB_ICONWARNING) != IDYES) {
+                free(checkedPaths);
                 break;
+            }
 
             // Delete each checked file
             int  failCount      = 0;
@@ -543,6 +710,7 @@ LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                     "%d file(s) moved to Recycle Bin.", checkedCount);
                 MessageBox(hwnd, msg, "Success", MB_OK | MB_ICONINFORMATION);
             }
+            free(checkedPaths);
             UpdateReportWindow();
             break;
         }

@@ -31,6 +31,11 @@
 // Alert limits
 #define MAX_DUPLICATES 100
 #define MAX_ALERTS     100
+#define MAX_EMPTY_FILES 1000
+
+// View modes for the report window
+#define VIEW_MODE_DUPLICATES 0
+#define VIEW_MODE_EMPTY      1
 
 // ----------------------------------------------------------------
 // DWM / ListView compat defines (not in all MinGW headers)
@@ -88,6 +93,12 @@ typedef struct {
     int files_remaining;
 } DuplicateAlert;
 
+typedef struct {
+    char filepath[MAX_PATH];
+    unsigned long long filesize;
+    char last_modified[32];
+} EmptyFileEntry;
+
 // ----------------------------------------------------------------
 // Globals — defined in their owning translation units
 // ----------------------------------------------------------------
@@ -105,6 +116,10 @@ extern DuplicateAlert    g_alerts[MAX_ALERTS];
 extern int               g_alert_count;
 extern int               g_current_alert_index;
 extern CRITICAL_SECTION  g_alert_lock;
+
+extern EmptyFileEntry    g_empty_entries[MAX_EMPTY_FILES];
+extern int               g_empty_count;
+extern int               g_view_mode;
 
 // gui_theme.c
 extern HBRUSH g_brBg;
@@ -127,9 +142,11 @@ int   CountRemainingFiles(DuplicateAlert *alert);
 int   FindNextValidGroup(int current_index, int direction);
 int   find_alert_by_hash(const char *filehash);
 void  ParseAlertJSON(const char *json);
+void  ParseEmptyFileJSON(const char *json);
 void  CompactAlerts(void);
 void  PromoteDuplicate(DuplicateAlert *alert);
 void  RemoveAlertAt(int index);
+void  RemoveEmptyEntry(const char *filepath);
 
 // gui_pipe.c
 DWORD WINAPI PipeReaderThread(LPVOID param);

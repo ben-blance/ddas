@@ -55,6 +55,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             snprintf(note, sizeof(note),
                 "Initial scan complete. Found %d duplicate group(s).", cnt);
             ShowTrayNotification("DDAS", note);
+        } else if (wParam == 2) {
+            // Empty file detected
+            if (g_hReportWnd) UpdateReportWindow();
         }
         break;
 

@@ -99,6 +99,10 @@ BOOL send_alert_scan_complete(int total_files, int duplicate_groups, const char 
 // Send error alert
 BOOL send_alert_error(const char *error_message, const char *timestamp);
 
+// Send empty-file detected alert
+BOOL send_alert_empty_file(const char *filepath, uint64_t filesize,
+                           const char *last_modified, const char *timestamp);
+
 // Send all stored alerts to newly connected client
 BOOL send_alert_history_to_client(void);
 

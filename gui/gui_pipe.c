@@ -44,6 +44,9 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
                 if (strstr(buffer, "\"type\":\"ALERT\"") && strstr(buffer, "\"DUPLICATE_DETECTED\"")) {
                     ParseAlertJSON(buffer);
                     PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 0, 0);
+                } else if (strstr(buffer, "\"EMPTY_FILE\"")) {
+                    ParseEmptyFileJSON(buffer);
+                    PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 2, 0);
                 } else if (strstr(buffer, "\"SCAN_COMPLETE\"")) {
                     PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 1, 0);
                 }
@@ -63,6 +66,9 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
             if (strstr(buffer, "\"type\":\"ALERT\"") && strstr(buffer, "\"DUPLICATE_DETECTED\"")) {
                 ParseAlertJSON(buffer);
                 PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 0, 0);
+            } else if (strstr(buffer, "\"EMPTY_FILE\"")) {
+                ParseEmptyFileJSON(buffer);
+                PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 2, 0);
             } else if (strstr(buffer, "\"SCAN_COMPLETE\"")) {
                 PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 1, 0);
             }
