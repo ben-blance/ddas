@@ -1,4 +1,5 @@
 #include "ipc_pipe.h"
+#include "scanner.h"
 #include "utils.h"
 #include <stdio.h>
 #include <string.h>
@@ -38,6 +39,7 @@ static BOOL send_message(const char *json_message);
 static void handle_client_commands(HANDLE pipe);
 static DuplicateGroup* find_or_create_group(const char *filehash);
 static BOOL send_duplicate_group(DuplicateGroup *group);
+static void handle_change_directory_command(const char *json);
 
 // Get current timestamp in ISO 8601 format
 void get_iso8601_timestamp(char *buffer, size_t buffer_size) {
@@ -430,6 +432,40 @@ static DWORD WINAPI pipe_server_thread(LPVOID param) {
     return 0;
 }
 
+// Parse and queue a CHANGE_DIRECTORY command from a JSON buffer
+static void handle_change_directory_command(const char *json) {
+    if (!strstr(json, "\"CHANGE_DIRECTORY\"")) return;
+
+    const char *pp = strstr(json, "\"path\":\"");
+    if (!pp) return;
+    pp += 8;
+    const char *pe = strchr(pp, '"');
+    if (!pe || (pe - pp) >= MAX_PATH) return;
+
+    // Unescape \\ → single backslash
+    char clean[MAX_PATH] = {0};
+    int wi = 0;
+    for (const char *ri = pp; ri < pe && wi < MAX_PATH - 1; ri++) {
+        if (*ri == '\\' && *(ri+1) == '\\') {
+            clean[wi++] = '\\';
+            ri++;
+        } else {
+            clean[wi++] = *ri;
+        }
+    }
+    clean[wi] = '\0';
+
+    if (clean[0] == '\0') return;
+
+    EnterCriticalSection(&g_groups_lock);
+    strncpy(g_pending_dir, clean, MAX_PATH - 1);
+    g_pending_dir[MAX_PATH - 1] = '\0';
+    g_dir_change_pending = TRUE;
+    LeaveCriticalSection(&g_groups_lock);
+
+    safe_printf("[IPC] Directory change queued: %s\n", clean);
+}
+
 // Handle incoming commands from GUI client
 static void handle_client_commands(HANDLE pipe) {
     char buffer[PIPE_BUFFER_SIZE];
@@ -452,6 +488,7 @@ static void handle_client_commands(HANDLE pipe) {
             if (bytes_read == 0) break;
             buffer[bytes_read] = '\0';
             safe_printf("[IPC] Received command: %s\n", buffer);
+            handle_change_directory_command(buffer);
             const char *response = "{\"type\":\"RESPONSE\",\"status\":\"OK\",\"message\":\"Command received\"}\n";
             DWORD bytes_written;
             WriteFile(pipe, response, strlen(response), &bytes_written, NULL);
@@ -472,6 +509,7 @@ static void handle_client_commands(HANDLE pipe) {
 
         buffer[bytes_read] = '\0';
         safe_printf("[IPC] Received command: %s\n", buffer);
+        handle_change_directory_command(buffer);
         const char *response = "{\"type\":\"RESPONSE\",\"status\":\"OK\",\"message\":\"Command received\"}\n";
         DWORD bytes_written;
         WriteFile(pipe, response, strlen(response), &bytes_written, NULL);
@@ -695,4 +733,21 @@ BOOL send_alert_empty_file(const char *filepath, uint64_t filesize,
     );
 
     return send_message(message);
+}
+
+// Clear all stored duplicate groups and empty-file records for a directory rescan
+void clear_ipc_state(void) {
+    if (!g_groups_initialized) return;
+
+    EnterCriticalSection(&g_groups_lock);
+    memset(g_duplicate_groups, 0, sizeof(g_duplicate_groups));
+    g_group_count = 0;
+    memset(g_empty_records, 0, sizeof(g_empty_records));
+    g_empty_record_count = 0;
+    LeaveCriticalSection(&g_groups_lock);
+}
+
+// Publicly accessible raw send (best-effort; does nothing if no client)
+void send_raw_notification(const char *json_message) {
+    send_message(json_message);
 }

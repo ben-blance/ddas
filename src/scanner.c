@@ -10,6 +10,8 @@
 volatile int g_scanning_complete = 0;
 volatile int g_stop_monitoring = 0;
 char g_monitor_path[MAX_PATH];
+volatile BOOL g_dir_change_pending = FALSE;
+char g_pending_dir[MAX_PATH];
 
 void scan_directory(const char *dir_path, HashTable *table, int *file_count) {
     WIN32_FIND_DATA find_data;

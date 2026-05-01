@@ -93,7 +93,8 @@ void UpdateReportWindow(void) {
 
         if (vi == 0) {
             SetDlgItemText(g_hReportWnd, 2007,
-                "No empty files detected yet - DDAS is watching for empty files.");
+                g_scanning ? "Scanning in progress..."
+                           : "No empty files found.");
         }
         LeaveCriticalSection(&g_alert_lock);
         return;
@@ -102,7 +103,8 @@ void UpdateReportWindow(void) {
     // Duplicates view
     if (g_alert_count == 0) {
         SetDlgItemText(g_hReportWnd, 2007,
-            "No duplicate alerts yet - DDAS is watching for duplicates.");
+            g_scanning ? "Scanning in progress..."
+                       : "No duplicate files found.");
         SetDlgItemText(g_hReportWnd, 2005, "");
         LeaveCriticalSection(&g_alert_lock);
         return;

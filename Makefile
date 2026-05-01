@@ -33,11 +33,12 @@ GUI_SRCS = $(GUI_DIR)/gui_tray.c \
            $(GUI_DIR)/gui_alerts.c \
            $(GUI_DIR)/gui_pipe.c \
            $(GUI_DIR)/gui_theme.c \
-           $(GUI_DIR)/gui_report.c
+           $(GUI_DIR)/gui_report.c \
+           $(GUI_DIR)/gui_settings.c
 GUI_OBJS = $(GUI_SRCS:.c=.o)
 
 # GUI libraries
-GUI_LIBS = -mwindows -lshell32 -lcomctl32 -luser32 -lgdi32 -luxtheme
+GUI_LIBS = -mwindows -lshell32 -lcomctl32 -luser32 -lgdi32 -luxtheme -lole32
 
 .PHONY: all clean engine gui run-engine run-gui run-both test help structure install stop
 

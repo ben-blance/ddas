@@ -49,6 +49,20 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
                     PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 2, 0);
                 } else if (strstr(buffer, "\"SCAN_COMPLETE\"")) {
                     PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 1, 0);
+                } else if (strstr(buffer, "\"DIRECTORY_CHANGED\"")) {
+                    // Extract path and update g_current_watch_dir
+                    const char *pp = strstr(buffer, "\"path\":\"");
+                    if (pp) {
+                        pp += 8;
+                        const char *pe = strchr(pp, '"');
+                        if (pe) {
+                            size_t l = (size_t)(pe - pp);
+                            if (l >= MAX_PATH) l = MAX_PATH - 1;
+                            memcpy(g_current_watch_dir, pp, l);
+                            g_current_watch_dir[l] = '\0';
+                        }
+                    }
+                    PostMessage(g_hMainWnd, WM_DIR_CHANGED, 0, 0);
                 }
                 continue;
             }
@@ -71,6 +85,19 @@ DWORD WINAPI PipeReaderThread(LPVOID param) {
                 PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 2, 0);
             } else if (strstr(buffer, "\"SCAN_COMPLETE\"")) {
                 PostMessage(g_hMainWnd, WM_PIPE_MESSAGE, 1, 0);
+            } else if (strstr(buffer, "\"DIRECTORY_CHANGED\"")) {
+                const char *pp = strstr(buffer, "\"path\":\"");
+                if (pp) {
+                    pp += 8;
+                    const char *pe = strchr(pp, '"');
+                    if (pe) {
+                        size_t l = (size_t)(pe - pp);
+                        if (l >= MAX_PATH) l = MAX_PATH - 1;
+                        memcpy(g_current_watch_dir, pp, l);
+                        g_current_watch_dir[l] = '\0';
+                    }
+                }
+                PostMessage(g_hMainWnd, WM_DIR_CHANGED, 0, 0);
             }
         }
 

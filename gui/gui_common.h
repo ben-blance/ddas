@@ -16,11 +16,19 @@
 // ----------------------------------------------------------------
 #define WM_TRAYICON     (WM_USER + 1)
 #define WM_PIPE_MESSAGE (WM_USER + 2)
+#define WM_DIR_CHANGED  (WM_USER + 3)   // posted when engine changes directory
 
 // Tray menu IDs
 #define ID_TRAY_EXIT        1001
 #define ID_TRAY_SHOW_WINDOW 1002
-#define ID_TRAY_ABOUT       1003
+#define ID_TRAY_SETTINGS    1003   // replaces About
+
+// Settings window control IDs
+#define ID_SETTINGS_PATH    4001
+#define ID_SETTINGS_BROWSE  4002
+#define ID_SETTINGS_APPLY   4003
+#define ID_SETTINGS_CANCEL  4004
+#define ID_SETTINGS_STATUS  4005
 
 // Context menu IDs
 #define IDM_CTX_SELECT      3001
@@ -106,10 +114,13 @@ typedef struct {
 // gui_tray.c
 extern HWND              g_hMainWnd;
 extern HWND              g_hReportWnd;
+extern HWND              g_hSettingsWnd;
 extern NOTIFYICONDATA    g_nid;
 extern HANDLE            g_hPipeThread;
 extern HANDLE            g_hPipe;
 extern volatile BOOL     g_running;
+
+extern char              g_current_watch_dir[MAX_PATH];
 
 // gui_alerts.c
 extern DuplicateAlert    g_alerts[MAX_ALERTS];
@@ -120,6 +131,7 @@ extern CRITICAL_SECTION  g_alert_lock;
 extern EmptyFileEntry    g_empty_entries[MAX_EMPTY_FILES];
 extern int               g_empty_count;
 extern int               g_view_mode;
+extern volatile BOOL     g_scanning;
 
 // gui_theme.c
 extern HBRUSH g_brBg;
@@ -162,6 +174,11 @@ void  DrawModernButton(LPDRAWITEMSTRUCT dis);
 void  UpdateReportWindow(void);
 void  ShowReportWindow(void);
 LRESULT CALLBACK ReportWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// gui_settings.c
+void  ShowSettingsWindow(void);
+BOOL  SendChangeDirectoryCommand(const char *path);
+LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // gui_tray.c
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

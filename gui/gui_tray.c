@@ -5,12 +5,14 @@
 // ----------------------------------------------------------------
 // Global definitions (owned here)
 // ----------------------------------------------------------------
-HWND           g_hMainWnd   = NULL;
-HWND           g_hReportWnd = NULL;
-NOTIFYICONDATA g_nid        = {0};
+HWND           g_hMainWnd    = NULL;
+HWND           g_hReportWnd  = NULL;
+HWND           g_hSettingsWnd = NULL;
+NOTIFYICONDATA g_nid         = {0};
 HANDLE         g_hPipeThread = NULL;
 HANDLE         g_hPipe       = INVALID_HANDLE_VALUE;
 volatile BOOL  g_running     = TRUE;
+char           g_current_watch_dir[MAX_PATH] = {0};
 
 // ----------------------------------------------------------------
 // Main (hidden) tray window procedure
@@ -48,6 +50,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         } else if (wParam == 1) {
             // Initial scan complete
+            g_scanning = FALSE;
             EnterCriticalSection(&g_alert_lock);
             int cnt = g_alert_count;
             LeaveCriticalSection(&g_alert_lock);
@@ -55,24 +58,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             snprintf(note, sizeof(note),
                 "Initial scan complete. Found %d duplicate group(s).", cnt);
             ShowTrayNotification("DDAS", note);
+            if (g_hReportWnd) UpdateReportWindow();
         } else if (wParam == 2) {
             // Empty file detected
             if (g_hReportWnd) UpdateReportWindow();
         }
         break;
 
+    case WM_DIR_CHANGED: {
+        // Engine started a new directory scan; clear all GUI data
+        g_scanning = TRUE;
+        EnterCriticalSection(&g_alert_lock);
+        memset(g_alerts, 0, sizeof(g_alerts));
+        g_alert_count         = 0;
+        g_current_alert_index = 0;
+        memset(g_empty_entries, 0, sizeof(g_empty_entries));
+        g_empty_count = 0;
+        LeaveCriticalSection(&g_alert_lock);
+
+        if (g_hReportWnd) UpdateReportWindow();
+        break;
+    }
+
     case WM_TRAYICON:
         if (lParam == WM_LBUTTONDBLCLK) {
-            EnterCriticalSection(&g_alert_lock);
-            int has = (g_alert_count > 0);
-            LeaveCriticalSection(&g_alert_lock);
-            if (has) ShowReportWindow();
+            ShowReportWindow();
         } else if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
             AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW_WINDOW, "Show Alerts");
-            AppendMenu(hMenu, MF_STRING, ID_TRAY_ABOUT,       "About");
+            AppendMenu(hMenu, MF_STRING, ID_TRAY_SETTINGS,    "Settings");
             AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
             AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT,        "Exit");
             SetForegroundWindow(hwnd);
@@ -85,23 +101,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case ID_TRAY_SHOW_WINDOW:
-            EnterCriticalSection(&g_alert_lock);
-            if (g_alert_count > 0) {
-                LeaveCriticalSection(&g_alert_lock);
-                ShowReportWindow();
-            } else {
-                LeaveCriticalSection(&g_alert_lock);
-                MessageBox(NULL, "No duplicates detected yet.", "DDAS",
-                    MB_OK | MB_ICONINFORMATION);
-            }
+            ShowReportWindow();
             break;
-        case ID_TRAY_ABOUT:
-            MessageBox(NULL,
-                "DDAS - Duplicate Detection & Alert System\n"
-                "Version 2.0 - Group-Based Tracking\n\n"
-                "Tracks duplicate file groups.\n"
-                "Updates groups when new duplicates are detected.",
-                "About DDAS", MB_OK | MB_ICONINFORMATION);
+        case ID_TRAY_SETTINGS:
+            ShowSettingsWindow();
             break;
         case ID_TRAY_EXIT:
             PostQuitMessage(0);
@@ -142,6 +145,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     InitializeCriticalSection(&g_alert_lock);
     InitCommonControls();
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     memset(g_alerts, 0, sizeof(g_alerts));
     g_alert_count         = 0;
@@ -184,6 +188,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (g_hPipe != INVALID_HANDLE_VALUE) CloseHandle(g_hPipe);
 
     DeleteCriticalSection(&g_alert_lock);
+    CoUninitialize();
     return (int)msg.wParam;
 }
 

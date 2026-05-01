@@ -12,6 +12,7 @@ CRITICAL_SECTION g_alert_lock;
 EmptyFileEntry   g_empty_entries[MAX_EMPTY_FILES];
 int              g_empty_count = 0;
 int              g_view_mode   = VIEW_MODE_DUPLICATES;
+volatile BOOL    g_scanning    = FALSE;
 
 // ----------------------------------------------------------------
 // File utilities

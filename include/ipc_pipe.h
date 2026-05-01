@@ -109,6 +109,12 @@ BOOL send_alert_history_to_client(void);
 // Remove a filepath from all duplicate groups (call when a file is renamed or deleted)
 void remove_filepath_from_ipc_groups(const char *filepath);
 
+// Clear all stored duplicate groups and empty-file records (call before a re-scan)
+void clear_ipc_state(void);
+
+// Send a raw pre-formatted JSON notification (non-blocking; ignores disconnected state)
+void send_raw_notification(const char *json_message);
+
 // Helper: Get current ISO 8601 timestamp
 void get_iso8601_timestamp(char *buffer, size_t buffer_size);
 
